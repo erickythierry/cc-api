@@ -165,7 +165,7 @@ com `tool_result` (que vira `role:"tool"` na wire do commandcode).
 | `stop_sequences` | ✅ cortado no proxy — a wire não tem; ao cortar, aborta o upstream |
 | `stream` (SSE completo, índices sequenciais, `input_json_delta`) | ✅ |
 | `thinking` (`adaptive`/`enabled`) | ⚠️ blocos `thinking` com `signature: ""` (ver limitações) |
-| `output_config.effort` / sufixo de effort no id do modelo | ✅ (sufixo tem precedência) |
+| `output_config.effort` / `thinking.budget_tokens` / sufixo de effort no id | ✅ (precedência: sufixo > `output_config.effort` > `budget_tokens`) |
 | `stop_reason` `end_turn`/`tool_use`/`max_tokens`/`stop_sequence` + `stop_sequence` | ✅ |
 | `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) | ✅ |
 | erros: HTTP + `error.type` Anthropic (`rate_limit_error`, `authentication_error`, `not_found_error`, `api_error`) | ✅ |
@@ -199,7 +199,7 @@ npm run test:openai     # só o dialeto OpenAI
 npm run typecheck       # tsc --noEmit (só checa tipos, não emite nada)
 ```
 
-Estado atual: **178 ok, 0 falhou** (131 no modo `--mock`).
+Estado atual: **189 ok, 0 falhou** (142 no modo `--mock`).
 
 A parte de conformidade sobe um upstream falso e cobre os caminhos que não dá pra provocar de
 propósito na API real: erro no meio do stream, HTTP 429/401/403 do upstream, NDJSON sem newline
@@ -261,11 +261,18 @@ deepseek/deepseek-v4-pro-max
 zai-org/GLM-5.3-low / -high / -max
 ```
 
-Esforços válidos por modelo (do bundle): deepseek-v4-pro/flash = `high|max`;
-GLM-5.3 = `low|high|max`; GLM-5.2 = `high|max`.
+Esforços listados por modelo (do bundle): deepseek-v4-pro/flash = `high|max`;
+GLM-5.3 = `low|high|max`; GLM-5.2 = `high|max`. Essa lista define só o que aparece em
+`GET /v1/models` — **qualquer** um dos cinco níveis funciona como sufixo em modelo com
+reasoning (medido no flash: `reasoning_tokens` low < high < max, apesar de o bundle só
+listar `high|max`). Modelo **sem** reasoning (`efforts: []`, ex. Kimi/MiniMax) descarta o
+esforço em vez de mandar um `reasoning_effort` que a wire ignora.
 
-Alternativa: mandar `"reasoning_effort": "high"` no body (OpenAI padrão) num modelo **sem**
-sufixo. Sufixo no id tem precedência sobre o body.
+Alternativa: mandar o esforço no body — `"reasoning_effort"` (OpenAI), `output_config.effort`
+(Anthropic; é onde o `claude --effort` do Claude Code cai) ou `thinking.budget_tokens`
+(Anthropic, mapeado por faixa: ≤2048 `low`, ≤8192 `medium`, ≤32768 `high`, acima `max`).
+Precedência: sufixo no id > `output_config.effort` > `budget_tokens`. Valor inválido é
+descartado, não vira erro.
 
 No opencode: os modelos-variante aparecem como `commandcode/deepseek/deepseek-v4-flash-max`
 em `/models`.

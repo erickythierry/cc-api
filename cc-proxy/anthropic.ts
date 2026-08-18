@@ -4,7 +4,7 @@
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { MODELS, resolveModel, EFFORT_LEVELS, type Model } from "./models.ts";
+import { MODELS, resolveModel, type Model } from "./models.ts";
 import {
   DEFAULT_SYSTEM,
   buildGenerateBody, callUpstream, classifyUpstreamError,
@@ -44,7 +44,7 @@ interface MessagesBody {
   stop_sequences?: string[];
   tools?: unknown;
   tool_choice?: { type?: string; name?: string };
-  thinking?: { type?: string };
+  thinking?: { type?: string; budget_tokens?: number };
   output_config?: { effort?: string };
 }
 
@@ -195,6 +195,16 @@ function usageOf(u: WireUsage | null) {
 
 // ---------- handler ----------
 // devolve true se tratou a rota, false se ela não é do dialeto Anthropic
+// A wire do commandcode não tem orçamento de tokens de raciocínio, só reasoning_effort.
+// Faixas iguais às do routatic-proxy, pros dois se comportarem igual no mesmo harness.
+function budgetTokensToEffort(budget: number | undefined): string | null {
+  if (typeof budget !== "number" || budget <= 0) return null;
+  if (budget <= 2048) return "low";
+  if (budget <= 8192) return "medium";
+  if (budget <= 32768) return "high";
+  return "max";
+}
+
 export async function handle(req: IncomingMessage, res: ServerResponse, path: string, sessionId: string): Promise<boolean> {
   if (req.method === "GET" && path === "/v1/models") {
     const data = MODELS.map(modelObject);
@@ -250,14 +260,16 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     return true;
   }
 
-  const { id: model, effort: modelEffort } = resolveModel(body.model);
   const thinkingType = body.thinking?.type;
   const wantThinking = !!body.thinking && thinkingType !== "disabled";
-  const cfgEffort = typeof body.output_config?.effort === "string" ? body.output_config.effort.toLowerCase() : null;
-  // sufixo de effort no id do modelo tem precedência sobre output_config.effort
-  const reasoningEffort = thinkingType === "disabled"
-    ? null
-    : (modelEffort ?? (cfgEffort && EFFORT_LEVELS.includes(cfgEffort) ? cfgEffort : null));
+  // esforço pedido pelo cliente: Claude Code manda o `--effort` em output_config.effort;
+  // harness que só fala thinking.budget_tokens cai no mapeamento por faixa
+  const cfgEffort = typeof body.output_config?.effort === "string"
+    ? body.output_config.effort
+    : budgetTokensToEffort(body.thinking?.budget_tokens);
+  // sufixo de effort no id do modelo tem precedência sobre o esforço pedido no body
+  const { id: model, effort: askedEffort } = resolveModel(body.model, cfgEffort);
+  const reasoningEffort = thinkingType === "disabled" ? null : askedEffort;
   const stream = body.stream === true;
   const stops = (Array.isArray(body.stop_sequences) ? body.stop_sequences : [])
     .filter((s) => typeof s === "string" && s.length);

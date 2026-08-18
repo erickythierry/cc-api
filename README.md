@@ -49,7 +49,7 @@ header: `anthropic-version`/`x-api-key` → shape Anthropic; senão OpenAI. Os p
 
 ## Validação
 
-- Suite `npm test` (em `cc-proxy/`): **178/178** (131 no modo `--mock`, sem custo). Três partes:
+- Suite `npm test` (em `cc-proxy/`): **189/189** (142 no modo `--mock`, sem custo). Três partes:
   - **conformidade** (`npm run test:mock`) — upstream falso cobre, nos dois dialetos: erro no meio do
     stream, HTTP 429/401/403, NDJSON sem newline final, tool executada pelo servidor, reasoning/cache,
     stop sequences, validação local, cancelamento, e — no lado Anthropic — a máquina de estado dos

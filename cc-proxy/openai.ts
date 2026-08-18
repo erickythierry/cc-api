@@ -4,7 +4,7 @@
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { MODELS, DEFAULT_MODEL, resolveModel, EFFORT_LEVELS, type Model } from "./models.ts";
+import { MODELS, DEFAULT_MODEL, resolveModel, type Model } from "./models.ts";
 import {
   DEFAULT_SYSTEM, MAX_TOKENS,
   buildGenerateBody, callUpstream, classifyUpstreamError, contentToText,
@@ -244,10 +244,8 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   }
 
   const requestedModel = typeof body.model === "string" && body.model ? body.model : DEFAULT_MODEL;
-  const { id: model, effort: modelEffort } = resolveModel(requestedModel);
   // reasoning_effort explícito no body (OpenAI padrão) só vale se o id do modelo não já fixou via sufixo
-  const bodyEffort = typeof body.reasoning_effort === "string" ? body.reasoning_effort.toLowerCase() : null;
-  const reasoningEffort = modelEffort ?? (bodyEffort && EFFORT_LEVELS.includes(bodyEffort) ? bodyEffort : null);
+  const { id: model, effort: reasoningEffort } = resolveModel(requestedModel, body.reasoning_effort);
   const stream = body.stream === true;
   const includeUsage = body.stream_options?.include_usage === true;
   const stops = (typeof body.stop === "string" ? [body.stop] : Array.isArray(body.stop) ? body.stop : [])

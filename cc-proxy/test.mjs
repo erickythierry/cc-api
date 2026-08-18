@@ -159,6 +159,18 @@ async function conformance() {
     check(`  error.code=${code}`, data?.error?.code === code, `code=${data?.error?.code}`);
   }
 
+  // esforço de raciocínio (resolveModel compartilhado com o dialeto Anthropic)
+  {
+    await post(MOCK_BASE, { model: `${MODEL}-low`, messages: [{ role: "user", content: "x" }] });
+    check("sufixo de nível fora do catálogo (-low) resolve", lastUpstreamBody?.params?.reasoning_effort === "low" && lastUpstreamBody?.params?.model === MODEL, `model=${lastUpstreamBody?.params?.model} effort=${lastUpstreamBody?.params?.reasoning_effort}`);
+    await post(MOCK_BASE, { model: `${MODEL}-max`, reasoning_effort: "low", messages: [{ role: "user", content: "x" }] });
+    check("sufixo vence reasoning_effort do body", lastUpstreamBody?.params?.reasoning_effort === "max");
+    await post(MOCK_BASE, { model: "moonshotai/Kimi-K3", reasoning_effort: "max", messages: [{ role: "user", content: "x" }] });
+    check("modelo sem reasoning descarta o effort", !("reasoning_effort" in (lastUpstreamBody?.params ?? {})));
+    await post(MOCK_BASE, { model: MODEL, reasoning_effort: "turbo", messages: [{ role: "user", content: "x" }] });
+    check("effort inválido é descartado", !("reasoning_effort" in (lastUpstreamBody?.params ?? {})));
+  }
+
   // erro no meio do stream: evento error, sem [DONE], sem finish_reason falso
   {
     const r = await fetch(`${MOCK_BASE}/v1/chat/completions`, {
@@ -364,6 +376,16 @@ async function anthropicConformance() {
     check("sufixo -max vence output_config.effort", lastUpstreamBody?.params?.reasoning_effort === "max" && lastUpstreamBody?.params?.model === MODEL, `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
     await postA(MOCK_BASE, MSG({ output_config: { effort: "high" }, thinking: { type: "disabled" } }));
     check("thinking disabled → sem reasoning_effort", !("reasoning_effort" in (lastUpstreamBody?.params ?? {})));
+    await postA(MOCK_BASE, MSG({ model: `${MODEL}-low` }));
+    check("sufixo de nível fora do catálogo (-low) resolve", lastUpstreamBody?.params?.reasoning_effort === "low" && lastUpstreamBody?.params?.model === MODEL, `model=${lastUpstreamBody?.params?.model} effort=${lastUpstreamBody?.params?.reasoning_effort}`);
+    for (const [budget, want] of [[1024, "low"], [4096, "medium"], [16000, "high"], [60000, "max"]]) {
+      await postA(MOCK_BASE, MSG({ thinking: { type: "enabled", budget_tokens: budget } }));
+      check(`  budget_tokens ${budget} → effort ${want}`, lastUpstreamBody?.params?.reasoning_effort === want, `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
+    }
+    await postA(MOCK_BASE, MSG({ output_config: { effort: "max" }, thinking: { type: "enabled", budget_tokens: 1024 } }));
+    check("output_config.effort vence budget_tokens", lastUpstreamBody?.params?.reasoning_effort === "max", `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
+    await postA(MOCK_BASE, MSG({ model: "moonshotai/Kimi-K3", output_config: { effort: "max" } }));
+    check("modelo sem reasoning descarta o effort", !("reasoning_effort" in (lastUpstreamBody?.params ?? {})), `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
     await postA(MOCK_BASE, MSG({ stop_sequences: ["FIM"] }));
     check("stop_sequences não vai pra wire", !("stop_sequences" in (lastUpstreamBody?.params ?? {})) && !("stop" in (lastUpstreamBody?.params ?? {})));
   }

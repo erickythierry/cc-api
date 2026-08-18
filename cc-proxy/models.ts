@@ -68,11 +68,36 @@ export const MODELS: Model[] = [
   ...BASE.flatMap(variants),
 ];
 
-// resolve id de modelo: se tem sufixo de esforço, devolve base + effort
-export function resolveModel(id: string): { id: string; effort: string | null } {
-  const m = MODELS.find((x) => x.id === id);
-  if (m?.effort) return { id: m.base as string, effort: m.effort };
-  return { id, effort: null };
+export const EFFORT_LEVELS: string[] = ["low", "medium", "high", "xhigh", "max"];
+
+const BY_ID = new Map(MODELS.map((m) => [m.id, m]));
+const BASE_BY_ID = new Map(BASE.map((b) => [b.id, b]));
+
+// Sufixo de esforço fora do catálogo: `-low` num modelo que só declara `high|max`.
+// A wire aceita os cinco níveis em qualquer modelo com reasoning (medido no flash:
+// reasoning_tokens low < high < max, apesar de o bundle só listar high|max), então o
+// sufixo resolve mesmo quando a variante não está no catálogo — o que o catálogo
+// controla é o que aparece em GET /v1/models, não o que a wire aceita.
+function splitEffortSuffix(id: string): { id: string; effort: string } | null {
+  for (const level of EFFORT_LEVELS) {
+    if (!id.endsWith(`-${level}`)) continue; // o hífen separa `-xhigh` de `-high`
+    const base = id.slice(0, -(level.length + 1));
+    if (BASE_BY_ID.has(base)) return { id: base, effort: level };
+  }
+  return null;
 }
 
-export const EFFORT_LEVELS: string[] = ["low", "medium", "high", "xhigh", "max"];
+// Resolve id de modelo + esforço numa decisão só (os dois dialetos passam por aqui).
+// Precedência: sufixo no id > esforço pedido pelo cliente. Modelo sem reasoning
+// (`efforts: []`) descarta o esforço — mandar reasoning_effort ali é ruído na wire.
+export function resolveModel(id: string, requested?: string | null): { id: string; effort: string | null } {
+  const listed = BY_ID.get(id);
+  const suffix = listed ? (listed.effort ? { id: listed.base as string, effort: listed.effort } : null) : splitEffortSuffix(id);
+
+  const asked = typeof requested === "string" ? requested.trim().toLowerCase() : null;
+  const base = suffix?.id ?? id;
+  let effort = suffix?.effort ?? (asked && EFFORT_LEVELS.includes(asked) ? asked : null);
+
+  if (effort && BASE_BY_ID.get(base)?.efforts.length === 0) effort = null;
+  return { id: base, effort };
+}
