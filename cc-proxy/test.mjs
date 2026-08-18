@@ -150,6 +150,21 @@ async function main() {
     }
   }
 
+  // 5b. variante de reasoning effort (sufixo -max resolve pra base + effort)
+  {
+    const r = await fetch(`${BASE}/v1/models`);
+    const j = await r.json();
+    const hasVariant = j.data.some((m) => m.id === "deepseek/deepseek-v4-flash-max");
+    check("variante -max no /v1/models", hasVariant);
+
+    const { status, data } = await chat({
+      model: "deepseek/deepseek-v4-flash-max",
+      messages: [{ role: "user", content: "Reply with exactly: OK" }],
+    });
+    check("chat com variante -max → 200", status === 200, `status=${status}`);
+    check("  content resposta", typeof data?.choices?.[0]?.message?.content === "string");
+  }
+
   // 6. sistema message
   {
     const { status, data } = await chat({

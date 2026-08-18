@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { randomUUID, randomBytes } from "node:crypto";
 
-import { MODELS, DEFAULT_MODEL } from "./models.mjs";
+import { MODELS, DEFAULT_MODEL, resolveModel, EFFORT_LEVELS } from "./models.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
@@ -105,12 +105,7 @@ async function imageUrlToDataUri(url) {
       return { image: `data:${mime};base64,${base64}`, mimeType: mime };
     }
   }
-  // http(s): baixa e codifica
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Não consegui buscar imagem: ${url} → ${r.status}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  const mime = r.headers.get("content-type")?.split(";")[0] || "image/png";
-  return { image: `data:${mime};base64,${buf.toString("base64")}`, mimeType: mime };
+  throw new Error("Imagem fora do padrão: só aceita data URI (base64).");
 }
 
 // monta mapa tool_call_id -> nome a partir de mensagens assistant anteriores
@@ -238,6 +233,24 @@ function readBody(req) {
   });
 }
 
+// lê o stream NDJSON do commandcode e entrega cada linha parseada
+async function* readEvents(readable) {
+  const reader = readable.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try { yield JSON.parse(line); } catch {}
+    }
+  }
+}
+
 function json(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
@@ -298,7 +311,11 @@ const server = createServer(async (req, res) => {
       return openAiError(res, 400, "Requisição não é JSON válido.");
     }
 
-    const model = typeof body.model === "string" && body.model ? body.model : DEFAULT_MODEL;
+    const requestedModel = typeof body.model === "string" && body.model ? body.model : DEFAULT_MODEL;
+    const { id: model, effort: modelEffort } = resolveModel(requestedModel);
+    // reasoning_effort explícito no body (OpenAI padrão) só vale se o id do modelo não já fixou via sufixo
+    const bodyEffort = typeof body.reasoning_effort === "string" ? body.reasoning_effort.toLowerCase() : null;
+    const reasoningEffort = modelEffort ?? (EFFORT_LEVELS.includes(bodyEffort) ? bodyEffort : null);
     const stream = body.stream === true;
     const includeUsage = body.stream_options?.include_usage === true;
     const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -333,10 +350,12 @@ const server = createServer(async (req, res) => {
         max_tokens: body.max_tokens ?? body.max_completion_tokens ?? MAX_TOKENS,
         stream: true,
         ...(typeof body.temperature === "number" ? { temperature: body.temperature } : {}),
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       },
     };
 
     const start = Date.now();
+    console.log(`[cc-proxy] ${requestedModel} → wire ${model}${reasoningEffort ? ` reasoning_effort=${reasoningEffort}` : ""}`);
     const headers = authHeaders(sessionId);
     let upstream;
     try {
@@ -359,52 +378,64 @@ const server = createServer(async (req, res) => {
     // ----- parse do stream NDJSON do commandcode -----
     const id = chatId();
     const created = Math.floor(Date.now() / 1000);
-
     const textParts = [];
     const toolCalls = []; // {index, id, name, arguments}
     let finalUsage = null;
     let wireFinish = "stop";
 
-    async function parseStream() {
-      const reader = upstream.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          let ev;
-          try { ev = JSON.parse(line); } catch { continue; }
-          switch (ev.type) {
-            case "text-delta": textParts.push(ev.text ?? ""); break;
-            case "tool-call": {
-              const idx = toolCalls.length;
-              const input = ev.input ?? ev.args ?? {};
-              toolCalls.push({
-                index: idx,
-                id: ev.toolCallId ?? `call_${idx}`,
-                name: ev.toolName ?? "unknown",
-                arguments: typeof input === "string" ? input : JSON.stringify(input),
-              });
-              break;
-            }
-            case "finish":
-              finalUsage = ev.totalUsage ?? null;
-              wireFinish = ev.rawFinishReason ?? ev.finishReason ?? "stop";
-              break;
-            case "error": {
-              const msg = ev.error?.message ?? ev.error ?? "erro no stream";
-              const err = new Error(msg);
-              err.isStreamError = true;
-              err.statusCode = ev.error?.statusCode ?? 500;
-              throw err;
-            }
-            case "abort": throw new Error("stream abortado");
+    const base = { id, object: "chat.completion.chunk", created, model };
+    const sendChunk = (chunk) => res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+
+    // consome o NDJSON do commandcode: atualiza estado e, se stream, emite SSE
+    async function handleStream(readable) {
+      let sentRole = false;
+      for await (const ev of readEvents(readable)) {
+        switch (ev.type) {
+          case "text-delta":
+            textParts.push(ev.text ?? "");
+            if (!stream) break;
+            if (!sentRole) { sendChunk({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }); sentRole = true; }
+            sendChunk({ ...base, choices: [{ index: 0, delta: { content: ev.text ?? "" }, finish_reason: null }] });
+            break;
+          case "tool-call": {
+            const idx = toolCalls.length;
+            const input = ev.input ?? ev.args ?? {};
+            const tc = {
+              index: idx,
+              id: ev.toolCallId ?? `call_${idx}`,
+              name: ev.toolName ?? "unknown",
+              arguments: typeof input === "string" ? input : JSON.stringify(input),
+            };
+            toolCalls.push(tc);
+            if (!stream) break;
+            if (!sentRole) { sendChunk({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }); sentRole = true; }
+            sendChunk({
+              ...base,
+              choices: [{
+                index: 0,
+                delta: {
+                  tool_calls: [{
+                    index: tc.index,
+                    id: tc.id,
+                    type: "function",
+                    function: { name: tc.name, arguments: tc.arguments },
+                  }],
+                },
+                finish_reason: null,
+              }],
+            });
+            break;
           }
+          case "finish":
+            finalUsage = ev.totalUsage ?? null;
+            wireFinish = ev.rawFinishReason ?? ev.finishReason ?? "stop";
+            break;
+          case "error": {
+            const err = new Error(ev.error?.message ?? ev.error ?? "erro no stream");
+            err.statusCode = ev.error?.statusCode ?? 500;
+            throw err;
+          }
+          case "abort": throw new Error("stream abortado");
         }
       }
     }
@@ -419,77 +450,8 @@ const server = createServer(async (req, res) => {
         "Access-Control-Allow-Origin": "*",
       });
 
-      const sendChunk = (chunk) => res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      const base = { id, object: "chat.completion.chunk", created, model };
-
       try {
-        // reproduz o stream com chunks OpenAI
-        const toolIdx = new Set();
-        const emitToolCall = (tc) => {
-          if (toolIdx.has(tc.index)) return;
-          toolIdx.add(tc.index);
-          sendChunk({
-            ...base,
-            choices: [{
-              index: 0,
-              delta: {
-                tool_calls: [{
-                  index: tc.index,
-                  id: tc.id,
-                  type: "function",
-                  function: { name: tc.name, arguments: tc.arguments },
-                }],
-              },
-              finish_reason: null,
-            }],
-          });
-        };
-
-        const reader = upstream.body.getReader();
-        const dec = new TextDecoder();
-        let buf = "";
-        let sentRole = false;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split("\n");
-          buf = lines.pop();
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            let ev;
-            try { ev = JSON.parse(line); } catch { continue; }
-            switch (ev.type) {
-              case "text-delta": {
-                if (!sentRole) { sendChunk({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }); sentRole = true; }
-                sendChunk({ ...base, choices: [{ index: 0, delta: { content: ev.text ?? "" }, finish_reason: null }] });
-                break;
-              }
-              case "tool-call": {
-                if (!sentRole) { sendChunk({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }); sentRole = true; }
-                const input = ev.input ?? ev.args ?? {};
-                const tc = {
-                  index: toolCalls.length,
-                  id: ev.toolCallId ?? `call_${toolCalls.length}`,
-                  name: ev.toolName ?? "unknown",
-                  arguments: typeof input === "string" ? input : JSON.stringify(input),
-                };
-                toolCalls.push(tc);
-                emitToolCall(tc);
-                break;
-              }
-              case "finish":
-                finalUsage = ev.totalUsage ?? null;
-                wireFinish = ev.rawFinishReason ?? ev.finishReason ?? "stop";
-                break;
-              case "error": {
-                const msg = ev.error?.message ?? ev.error ?? "erro no stream";
-                throw new Error(msg);
-              }
-              case "abort": throw new Error("stream abortado");
-            }
-          }
-        }
+        await handleStream(upstream.body);
 
         const fr = toolCalls.length ? "tool_calls" : finishReason(wireFinish);
         sendChunk({ ...base, choices: [{ index: 0, delta: {}, finish_reason: fr }] });
@@ -514,7 +476,7 @@ const server = createServer(async (req, res) => {
 
     // ---------- não-stream ----------
     try {
-      await parseStream();
+      await handleStream(upstream.body);
     } catch (e) {
       return openAiError(res, 502, e.message, "upstream_error", e.statusCode ?? null);
     }

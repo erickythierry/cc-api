@@ -43,6 +43,8 @@ harness (OpenAI) ──► cc-proxy :8787 ──► api.commandcode.ai/alpha/gen
 ## Modelos
 
 Default: `deepseek/deepseek-v4-flash`. Catálogo completo em `cc-proxy/models.mjs` (extraído do bundle `command-code@1.27.1`).
+Modelos com reasoning expõem variantes de esforço por sufixo no id — `deepseek/deepseek-v4-flash-max`,
+`-high`, `zai-org/GLM-5.3-low`, etc. — resolvidas no proxy e repassadas como `reasoning_effort` na wire.
 
 ## Detalhes da extração
 

@@ -110,7 +110,7 @@ tool, system message, endpoints de erro. Consome crédito do plano (janela 5h/6h
 | `COMMAND_CODE_API_KEY` | lê `~/.commandcode/auth.json` | key do commandcode |
 | `COMMANDCODE_API_URL` | `https://api.commandcode.ai` | upstream |
 
-## Modelos
+## Modelos e reasoning effort
 
 Catálogo em `models.mjs` (extraído do bundle `command-code@1.27.1`). Plano **Go** libera
 opensource (`cai`): deepseek, Kimi, GLM, MiniMax, Qwen, mimo (visão), etc. Modelo premium
@@ -118,6 +118,31 @@ opensource (`cai`): deepseek, Kimi, GLM, MiniMax, Qwen, mimo (visão), etc. Mode
 erro `502`.
 
 Default: `deepseek/deepseek-v4-flash`.
+
+### Nível de raciocínio via sufixo no id do modelo
+
+Modelos com esforço suportado expõem **variantes** `-low` / `-medium` / `-high` / `-xhigh` / `-max`
+no id — cada uma vira um modelo separado na API. O proxy resolve o sufixo e manda
+`reasoning_effort` na wire do commandcode. Funciona em qualquer harness (só trocar o id).
+
+```
+deepseek/deepseek-v4-flash          # default (sem effort explícito)
+deepseek/deepseek-v4-flash-high     # effort=high
+deepseek/deepseek-v4-flash-max      # effort=max
+deepseek/deepseek-v4-pro-max
+zai-org/GLM-5.3-low / -high / -max
+google/gemini-3.7-flash-low / -medium / -high
+```
+
+Esforços válidos por modelo (do bundle): deepseek-v4-pro/flash = `high|max`;
+GLM-5.3 = `low|high|max`; GLM-5.2 = `high|max`; gemini-3.x-flash = `low|medium|high`;
+claude-* = `low|medium|high|xhigh|max`.
+
+Alternativa: mandar `"reasoning_effort": "high"` no body (OpenAI padrão) num modelo **sem**
+sufixo. Sufixo no id tem precedência sobre o body.
+
+No opencode: os modelos-variante aparecem como `commandcode/deepseek/deepseek-v4-flash-max`
+em `/models`.
 
 ## Limitações (de propósito)
 
