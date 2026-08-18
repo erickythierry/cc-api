@@ -16,12 +16,15 @@ export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 // e o modelo passa a se apresentar como agente de terminal). Um system mínimo evita os dois.
 export const DEFAULT_SYSTEM = process.env.CC_DEFAULT_SYSTEM || "You are a helpful assistant.";
 export const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
+// travou de vez (stream pendurado): nenhum byte do upstream por este tempo cancela a request
+export const UPSTREAM_IDLE_TIMEOUT_MS = Number(process.env.CC_IDLE_TIMEOUT_MS) || 60 * 1000;
 
 // ---------- tipos da wire ----------
 export interface WireImage { image: string; mimeType: string }
 
 export type WirePart =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
   | { type: "image"; image: string; mimeType: string }
   | { type: "tool-call"; toolCallId: string; toolName: string; input: unknown }
   | { type: "tool-result"; toolCallId: string; toolName: string; output: { type: "text"; value: string } };
@@ -199,7 +202,7 @@ export function makeStopFilter(stops: string[]): StopFilter {
 
 // ---------- erro do upstream -> kind neutro ----------
 // Cada dialeto traduz o kind para o seu shape de erro (ver openai.ts / anthropic.ts).
-export type ErrorKind = "rate_limit" | "not_found" | "auth" | "permission" | "invalid" | "upstream";
+export type ErrorKind = "rate_limit" | "not_found" | "auth" | "permission" | "invalid" | "overloaded" | "upstream";
 
 export function classifyUpstreamError(status: number, message: string): { kind: ErrorKind; status: number } {
   const m = String(message || "").toLowerCase();
@@ -210,6 +213,8 @@ export function classifyUpstreamError(status: number, message: string): { kind: 
   if (status === 401 || /invalid .*authorization|unauthorized|invalid api key/.test(m))
     return { kind: "auth", status: 401 };
   if (status === 403) return { kind: "permission", status: 403 };
+  // overloaded (529 Anthropic / 503 OpenCode): dispara retry/backoff no cliente
+  if (status === 529 || status === 503) return { kind: "overloaded", status };
   if (status >= 400 && status < 500) return { kind: "invalid", status };
   return { kind: "upstream", status: 502 };
 }
@@ -225,7 +230,8 @@ export function readBody(req: IncomingMessage): Promise<string> {
 }
 
 // lê o stream NDJSON do commandcode e entrega cada linha parseada
-export async function* readEvents(readable: ReadableStream<Uint8Array>): AsyncGenerator<WireEvent> {
+// `onChunk` dispara a cada batch de bytes lido do upstream — usado pelo idle watchdog
+export async function* readEvents(readable: ReadableStream<Uint8Array>, opts?: { onChunk?: () => void }): AsyncGenerator<WireEvent> {
   const reader = readable.getReader();
   const dec = new TextDecoder();
   let buf = "";
@@ -233,6 +239,7 @@ export async function* readEvents(readable: ReadableStream<Uint8Array>): AsyncGe
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      opts?.onChunk?.();
       buf += dec.decode(value, { stream: true });
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";

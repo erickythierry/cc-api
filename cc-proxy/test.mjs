@@ -19,6 +19,7 @@ const rnd = () => 8800 + Math.floor(Math.random() * 900);
 const MOCK_PORT = rnd(), PROXY_MOCK_PORT = rnd(), PROXY_PORT = rnd();
 const MOCK_BASE = `http://127.0.0.1:${PROXY_MOCK_PORT}`;
 const BASE = `http://127.0.0.1:${PROXY_PORT}`;
+const PROXY_IDLE_PORT = rnd(), IDLE_BASE = `http://127.0.0.1:${PROXY_IDLE_PORT}`;
 const MODEL = "deepseek/deepseek-v4-flash";
 
 let passed = 0, failed = 0;
@@ -64,6 +65,12 @@ const SCENARIOS = {
     { type: "tool-call", toolName: "get_weather", toolCallId: "tc_9", input: { city: "Paris" } },
     { type: "finish", finishReason: "tool_calls", totalUsage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } },
   ],
+  // reasoning entregue num delta só (grande): o proxy precisa re-chunkar na saída
+  "long-reasoning": [
+    { type: "reasoning-delta", text: "x".repeat(200) },
+    { type: "text-delta", text: "ok" },
+    { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 5, outputTokens: 9, totalTokens: 14 } },
+  ],
 };
 let lastUpstreamBody = null;
 let upstreamAborted = false;
@@ -75,6 +82,8 @@ const mock = createServer(async (req, res) => {
   if (sc === "http-429") { res.writeHead(429, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message: "rate limit exceeded" } })); return; }
   if (sc === "http-401") { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message: "Invalid 'Authorization' header" } })); return; }
   if (sc === "not-in-plan") { res.writeHead(403, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message: "model_not_in_plan" } })); return; }
+  if (sc === "http-503") { res.writeHead(503, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message: "overloaded" } })); return; }
+  if (sc === "http-529") { res.writeHead(529, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message: "overloaded" } })); return; }
   if (sc === "slow") {
     // stream que nunca termina: serve pra provar que o cliente desconectando aborta o upstream
     upstreamAborted = false;
@@ -82,6 +91,14 @@ const mock = createServer(async (req, res) => {
     res.write(JSON.stringify({ type: "text-delta", text: "parcial" }) + "\n");
     // 'close' da resposta só dispara quando o proxy derruba a conexão (cliente sumiu)
     res.on("close", () => { if (!res.writableFinished) upstreamAborted = true; });
+    return;
+  }
+  if (sc === "slow-finish") {
+    // stream que fica ~3s em silêncio depois do primeiro delta: prova o keepalive ping
+    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    res.write(JSON.stringify({ type: "text-delta", text: "lento" }) + "\n");
+    await sleep(3200);
+    res.end(JSON.stringify({ type: "finish", finishReason: "stop", totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }) + "\n");
     return;
   }
   const evs = SCENARIOS[sc] ?? [{ type: "text-delta", text: "default" }, { type: "finish", finishReason: "stop", totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }];
@@ -157,6 +174,10 @@ async function conformance() {
     const { status, data } = await post(MOCK_BASE, { model, messages: [{ role: "user", content: "x" }] });
     check(`upstream ${model} → HTTP ${want}`, status === want, `status=${status}`);
     check(`  error.code=${code}`, data?.error?.code === code, `code=${data?.error?.code}`);
+  }
+  {
+    const { status, data } = await post(MOCK_BASE, { model: "http-503", messages: [{ role: "user", content: "x" }] });
+    check("upstream 503 → overloaded_error", status === 503 && data?.error?.type === "overloaded_error", `status=${status} type=${data?.error?.type}`);
   }
 
   // esforço de raciocínio (resolveModel compartilhado com o dialeto Anthropic)
@@ -349,8 +370,28 @@ async function anthropicConformance() {
     check("tool_result vira mensagem wire role:tool", m[2]?.role === "tool" && m[2]?.content?.[0]?.type === "tool-result", JSON.stringify(m[2]));
     check("  toolCallId/toolName resolvidos", m[2]?.content?.[0]?.toolCallId === "tu_1" && m[2]?.content?.[0]?.toolName === "get_weather");
     check("  tool antes de user (mensagem mista vira 2)", m[3]?.role === "user" && m[3]?.content?.[0]?.text === "e amanhã?", JSON.stringify(m[3]));
-    check("  assistant: thinking descartado, resto preservado", m[1]?.role === "assistant" && m[1].content.length === 2 && m[1].content[0].type === "text" && m[1].content[1].type === "tool-call");
-    check("  tool_use → tool-call com input objeto", typeof m[1]?.content?.[1]?.input === "object" && m[1].content[1].input.city === "Paris");
+    check("  assistant: thinking preservado como reasoning", m[1]?.role === "assistant" && m[1].content.length === 3 && m[1].content[0].type === "reasoning" && m[1].content[0].text === "hmm" && m[1].content[1].type === "text" && m[1].content[2].type === "tool-call");
+    check("  tool_use → tool-call com input objeto", typeof m[1]?.content?.[2]?.input === "object" && m[1].content[2].input.city === "Paris");
+  }
+  {
+    // EnsureThinkingBlocks: tool turn sem thinking ganha reasoning placeholder (round-trip de tool)
+    await postA(MOCK_BASE, MSG({ messages: [
+      { role: "user", content: "clima?" },
+      { role: "assistant", content: [{ type: "text", text: "vou ver" }, { type: "tool_use", id: "tu_1", name: "get_weather", input: { city: "Paris" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: "18C" }] },
+    ] }));
+    const asst = (lastUpstreamBody?.params?.messages ?? []).find((x) => x.role === "assistant");
+    check("tool turn sem thinking → reasoning injetado", asst?.content?.some((p) => p.type === "reasoning"), JSON.stringify(asst?.content));
+  }
+  {
+    await postA(MOCK_BASE, MSG({ messages: [
+      { role: "user", content: "clima?" },
+      { role: "assistant", content: [{ type: "redacted_thinking", data: "abc" }, { type: "tool_use", id: "tu_1", name: "get_weather", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: "18C" }] },
+    ] }));
+    const asst = (lastUpstreamBody?.params?.messages ?? []).find((x) => x.role === "assistant");
+    const r = asst?.content?.find((p) => p.type === "reasoning");
+    check("redacted_thinking → reasoning placeholder", r?.text === " ", JSON.stringify(asst?.content));
   }
   {
     await postA(MOCK_BASE, MSG({ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "zz", content: [{ type: "text", text: "boom" }], is_error: true }] }] }));
@@ -386,6 +427,23 @@ async function anthropicConformance() {
     check("output_config.effort vence budget_tokens", lastUpstreamBody?.params?.reasoning_effort === "max", `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
     await postA(MOCK_BASE, MSG({ model: "moonshotai/Kimi-K3", output_config: { effort: "max" } }));
     check("modelo sem reasoning descarta o effort", !("reasoning_effort" in (lastUpstreamBody?.params ?? {})), `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
+    // grafias alternativas de effort (razing.effort / effort / level / depth)
+    for (const [extra, want] of [
+      [{ reasoning: { effort: "medium" } }, "medium"],
+      [{ effort: "high" }, "high"],
+      [{ level: "low" }, "low"],
+      [{ depth: 1 }, "low"],
+      [{ depth: 2 }, "medium"],
+      [{ depth: 3 }, "high"],
+      [{ depth: 5 }, "max"],
+    ]) {
+      await postA(MOCK_BASE, MSG(extra));
+      check(`  grafia ${JSON.stringify(extra)} → effort ${want}`, lastUpstreamBody?.params?.reasoning_effort === want, `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
+    }
+    await postA(MOCK_BASE, MSG({ output_config: { effort: "high" }, reasoning: { effort: "low" } }));
+    check("  output_config.effort vence reasoning.effort", lastUpstreamBody?.params?.reasoning_effort === "high");
+    await postA(MOCK_BASE, MSG({ depth: "x" }));
+    check("  depth inválido → sem effort", !("reasoning_effort" in (lastUpstreamBody?.params ?? {})), `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
     await postA(MOCK_BASE, MSG({ stop_sequences: ["FIM"] }));
     check("stop_sequences não vai pra wire", !("stop_sequences" in (lastUpstreamBody?.params ?? {})) && !("stop" in (lastUpstreamBody?.params ?? {})));
   }
@@ -467,6 +525,18 @@ async function anthropicConformance() {
     check("  signature_delta antes do stop", events.some((e) => e.data?.delta?.type === "signature_delta"));
   }
   {
+    // reasoning entregue num delta só e grande: re-chunk em vários thinking_delta com pacing
+    const { events } = await streamA(MOCK_BASE, MSG({ model: "long-reasoning", thinking: { type: "adaptive" } }));
+    const deltas = events.filter((e) => e.data?.delta?.type === "thinking_delta");
+    check("re-chunk: reasoning grande vira vários thinking_delta", deltas.length >= 4, `n=${deltas.length}`);
+    check("  texto íntegro entre deltas", deltas.map((e) => e.data.delta.thinking).join("") === "x".repeat(200), `len=${deltas.map((e) => e.data.delta.thinking).join("").length}`);
+  }
+  {
+    // upstream em silêncio >3s entre deltas: keepalive ping mantém o stream vivo
+    const { events } = await streamA(MOCK_BASE, MSG({ model: "slow-finish" }));
+    check("stream idle → keepalive ping", events.some((e) => e.event === "ping" && e.data?.type === "ping"), events.map((e) => e.event).join(","));
+  }
+  {
     const { events, text } = await streamA(MOCK_BASE, MSG({ model: "mid-error" }));
     const errIdx = events.findIndex((e) => e.event === "error");
     check("erro mid-stream → evento error", errIdx !== -1 && events[errIdx].data?.error?.type === "rate_limit_error", text.slice(0, 200));
@@ -485,6 +555,14 @@ async function anthropicConformance() {
       const { status, data } = await postA(MOCK_BASE, MSG({ model }));
       check(`upstream ${model} → HTTP ${want} ${type}`, status === want && data?.error?.type === type, `status=${status} type=${data?.error?.type}`);
     }
+    for (const [model, want] of [["http-503", 503], ["http-529", 529]]) {
+      const { status, data } = await postA(MOCK_BASE, MSG({ model }));
+      check(`upstream ${model} → overloaded_error`, status === want && data?.error?.type === "overloaded_error", `status=${status} type=${data?.error?.type}`);
+    }
+  }
+  {
+    const r = await fetch(`${MOCK_BASE}/v1/messages`, { method: "POST", headers: A_HEADERS, body: JSON.stringify(MSG({ model: "http-429" })) });
+    check("429 → header Retry-After: 30", r.headers.get("retry-after") === "30", `ra=${r.headers.get("retry-after")}`);
   }
 
   // --- rotas / desambiguação de /v1/models ---
@@ -513,6 +591,10 @@ async function anthropicConformance() {
     check("POST /v1/messages/count_tokens → {input_tokens}", r.status === 200 && typeof r.data?.input_tokens === "number" && r.data.input_tokens > 0 && Object.keys(r.data).length === 1, JSON.stringify(r.data));
     const r2 = await postA(MOCK_BASE, { model: "x" }, "/v1/messages/count_tokens");
     check("  sem messages → 400", r2.status === 400);
+    // base64 de ~1.5MB em imagem: o char/4 antigo estouraria (~350k tokens); estimativa clampa ~4000
+    const bigB64 = "A".repeat(2 * 1024 * 1024);
+    const r3 = await postA(MOCK_BASE, { model: "x", messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: bigB64 } }, { type: "text", text: "o que é?" }] }] }, "/v1/messages/count_tokens");
+    check("  imagem não estoura a conta", r3.status === 200 && r3.data.input_tokens > 0 && r3.data.input_tokens < 10000, `input_tokens=${r3.data?.input_tokens}`);
   }
 
   // --- prefixo /anthropic e cancelamento ---
@@ -526,6 +608,16 @@ async function anthropicConformance() {
     }).then((r2) => r2.body.getReader().read()).catch(() => null);
     await sleep(400); ac.abort(); await p.catch(() => {}); await sleep(400);
     check("cliente desconecta → upstream abortado", upstreamAborted === true);
+  }
+
+  // --- idle watchdog (proxy dedicado com timeout curto) ---
+  {
+    procs.push(startProxy(PROXY_IDLE_PORT, { COMMANDCODE_API_URL: `http://127.0.0.1:${MOCK_PORT}`, COMMAND_CODE_API_KEY: "fake-key", CC_IDLE_TIMEOUT_MS: "500" }));
+    await waitUp(IDLE_BASE);
+    const r = await fetch(`${IDLE_BASE}/v1/messages`, { method: "POST", headers: A_HEADERS, body: JSON.stringify(MSG({ model: "slow", stream: true })) });
+    const text = await r.text();
+    const evs = sseEvents(text);
+    check("idle watchdog: stream pendurado → evento error", evs.some((e) => e.event === "error"), evs.map((e) => e.event).join(","));
   }
 }
 

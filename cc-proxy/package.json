@@ -24,5 +24,8 @@
     "@types/node": "^24.10.0",
     "openai": "^7.5.0",
     "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "gpt-tokenizer": "^4.0.0"
   }
 }

@@ -54,6 +54,7 @@ const ERROR_MAP: Record<ErrorKind, { type: string; code: string | null }> = {
   permission: { type: "invalid_request_error", code: "permission_denied" },
   not_found: { type: "invalid_request_error", code: "model_not_found" },
   invalid: { type: "invalid_request_error", code: null },
+  overloaded: { type: "overloaded_error", code: null },
   upstream: { type: "upstream_error", code: null },
 };
 function mapUpstreamError(status: number, message: string) {

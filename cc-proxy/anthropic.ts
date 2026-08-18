@@ -3,10 +3,11 @@
 
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { encode } from "gpt-tokenizer";
 
-import { MODELS, resolveModel, type Model } from "./models.ts";
+import { EFFORT_LEVELS, MODELS, resolveModel, type Model } from "./models.ts";
 import {
-  DEFAULT_SYSTEM,
+  DEFAULT_SYSTEM, UPSTREAM_IDLE_TIMEOUT_MS,
   buildGenerateBody, callUpstream, classifyUpstreamError,
   errMessage, errStatus, imageUrlToDataUri, json, makeStopFilter, readBody, readEvents,
   sseHead, StreamError, toWireTools, upstreamErrorMessage,
@@ -19,6 +20,7 @@ const BOOT_ISO = new Date().toISOString();
 interface AnthropicBlock {
   type?: string;
   text?: string;
+  thinking?: string;
   id?: string;
   name?: string;
   input?: unknown;
@@ -46,6 +48,10 @@ interface MessagesBody {
   tool_choice?: { type?: string; name?: string };
   thinking?: { type?: string; budget_tokens?: number };
   output_config?: { effort?: string };
+  reasoning?: { effort?: string };
+  effort?: string;
+  level?: string;
+  depth?: string | number;
 }
 
 // blocos de conteúdo devolvidos ao cliente
@@ -61,6 +67,7 @@ const ERROR_MAP: Record<ErrorKind, string> = {
   permission: "permission_error",
   not_found: "not_found_error",
   invalid: "invalid_request_error",
+  overloaded: "overloaded_error",
   upstream: "api_error",
 };
 function mapUpstreamError(status: number, message: string) {
@@ -72,6 +79,24 @@ const hex = (n: number) => randomBytes(n).toString("hex");
 const messageId = () => `msg_${hex(12)}`;
 const toolUseId = () => `toolu_${hex(12)}`;
 const requestId = () => `req_${hex(12)}`;
+
+// Retry-After no 429 (rate_limit): o Claude Code lê o header pra backoff. No meio de um stream
+// SSE os headers já foram enviados — lá o que vale é o error.type rate_limit_error.
+function setRetryAfter(res: ServerResponse, status: number): void {
+  if (status === 429 && !res.headersSent) res.setHeader("Retry-After", "30");
+}
+
+// keepalive do stream (mesmo heartbeat da Messages API real) e pacing do reasoning
+const PING_MS = 3000;
+const THINK_CHUNK = 48; // runes por thinking_delta (mesmo budget do routatic)
+const THINK_DELAY = 80; // ms entre deltas
+
+function chunkRunes(s: string, n: number): string[] {
+  const runes = Array.from(s);
+  const out: string[] = [];
+  for (let i = 0; i < runes.length; i += n) out.push(runes.slice(i, i + n).join(""));
+  return out;
+}
 
 export function anthropicError(res: ServerResponse, status: number, message: string, type = "invalid_request_error"): void {
   json(res, status, { type: "error", error: { type, message }, request_id: requestId() });
@@ -137,10 +162,24 @@ async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage
 
     if (msg.role === "assistant") {
       const parts: WirePart[] = [];
+      let hasReasoning = false;
       for (const b of blocks) {
         if (!b) continue;
         if (b.type === "text" && b.text) parts.push({ type: "text", text: b.text });
-        else if (b.type === "tool_use") {
+        else if (b.type === "thinking" && typeof b.thinking === "string") {
+          // round-trip de reasoning: DeepSeek exige o thinking do turno anterior na próxima chamada
+          parts.push({ type: "reasoning", text: b.thinking });
+          hasReasoning = true;
+        } else if (b.type === "redacted_thinking") {
+          // sem conteúdo (censurado); o placeholder marca o turno como "pensou"
+          parts.push({ type: "reasoning", text: " " });
+          hasReasoning = true;
+        } else if (b.type === "tool_use") {
+          // EnsureThinkingBlocks: tool turn sem reasoning é rejeitado pelo upstream em thinking mode
+          if (!hasReasoning) {
+            parts.push({ type: "reasoning", text: " " });
+            hasReasoning = true;
+          }
           parts.push({
             type: "tool-call",
             toolCallId: b.id ?? toolUseId(),
@@ -148,7 +187,6 @@ async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage
             input: b.input ?? {},
           });
         }
-        // thinking / redacted_thinking: descartados (a wire não aceita replay de reasoning)
       }
       // assistant vazio quebra a validação Zod do upstream
       if (parts.length) wire.push({ role: "assistant", content: parts });
@@ -185,6 +223,9 @@ async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage
 
 function usageOf(u: WireUsage | null) {
   if (!u) return { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+  // `inputTokens` da wire JÁ é o não-cache (medido: 97 tok num prompt de 5 palavras com o
+  // prompt de agente em cacheReadTokens; real multi-turn confirmou ~426 num turno pequeno).
+  // Subtrair cache aqui inflaria o gauge de contexto do Claude Code e dispararia auto-compact.
   return {
     input_tokens: u.inputTokens ?? 0,
     output_tokens: u.outputTokens ?? 0,
@@ -205,6 +246,50 @@ function budgetTokensToEffort(budget: number | undefined): string | null {
   return "max";
 }
 
+// ---------- count_tokens: tokenizer cl100k real + estimativa de imagem ----------
+// cl100k_base (gpt-tokenizer, o mesmo que o @anthropic-ai/sdk usa por baixo). Para DeepSeek
+// é aproximado, mas ordens de grandeza melhor que char/4 — e o base64 de imagem nunca é
+// tokenizado (estouraria a conta em ~350k por screenshot).
+const textTokens = (s: string) => (s ? encode(s).length : 0);
+
+// heurística do routatic: ~rawBytes/75, clamp 300-4000; URL sem dados → 1500 default
+function imageTokens(block: AnthropicBlock): number {
+  const src = block.source ?? {};
+  if (src.type === "base64") {
+    const rawBytes = Math.floor(((src.data ?? "").length * 3) / 4);
+    return Math.max(300, Math.min(4000, Math.floor(rawBytes / 75)));
+  }
+  return 1500;
+}
+
+function countContentTokens(blocks: AnthropicBlock[]): number {
+  let n = 0;
+  for (const b of blocks) {
+    if (!b) continue;
+    if (b.type === "text" && b.text) n += textTokens(b.text);
+    else if (b.type === "thinking" && typeof b.thinking === "string") n += textTokens(b.thinking);
+    else if (b.type === "tool_use") n += textTokens(JSON.stringify(b.input ?? {}));
+    else if (b.type === "tool_result") n += typeof b.content === "string" ? textTokens(b.content) : countContentTokens((b.content ?? []) as AnthropicBlock[]);
+    else if (b.type === "image") n += imageTokens(b);
+    else if (b.type === "redacted_thinking") n += 1;
+  }
+  return n;
+}
+
+function countTokensBody(body: MessagesBody): number {
+  let n = 0;
+  if (typeof body.system === "string") n += textTokens(body.system);
+  else if (Array.isArray(body.system)) n += countContentTokens(body.system as AnthropicBlock[]);
+  for (const msg of body.messages ?? []) {
+    if (!msg) continue;
+    const c = msg.content;
+    if (typeof c === "string") n += textTokens(c);
+    else if (Array.isArray(c)) n += countContentTokens(c as AnthropicBlock[]);
+  }
+  if (Array.isArray(body.tools)) n += textTokens(JSON.stringify(body.tools));
+  return n;
+}
+
 export async function handle(req: IncomingMessage, res: ServerResponse, path: string, sessionId: string): Promise<boolean> {
   if (req.method === "GET" && path === "/v1/models") {
     const data = MODELS.map(modelObject);
@@ -220,8 +305,6 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     return true;
   }
 
-  // estimativa local: a wire do commandcode não expõe tokenizer nem endpoint de contagem.
-  // ponytail: contagem por caracteres (~±25%); troca por contagem real se o upstream publicar uma.
   if (req.method === "POST" && path === "/v1/messages/count_tokens") {
     let body: MessagesBody;
     try { body = JSON.parse(await readBody(req)) as MessagesBody; } catch { anthropicError(res, 400, "Requisição não é JSON válido."); return true; }
@@ -230,8 +313,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
       anthropicError(res, 400, "messages: at least one message is required");
       return true;
     }
-    const chars = JSON.stringify([body.system ?? "", messages, body.tools ?? []]).length;
-    json(res, 200, { input_tokens: Math.max(1, Math.ceil(chars / 4)) });
+    json(res, 200, { input_tokens: Math.max(1, countTokensBody(body)) });
     return true;
   }
 
@@ -262,11 +344,19 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
 
   const thinkingType = body.thinking?.type;
   const wantThinking = !!body.thinking && thinkingType !== "disabled";
-  // esforço pedido pelo cliente: Claude Code manda o `--effort` em output_config.effort;
-  // harness que só fala thinking.budget_tokens cai no mapeamento por faixa
-  const cfgEffort = typeof body.output_config?.effort === "string"
-    ? body.output_config.effort
-    : budgetTokensToEffort(body.thinking?.budget_tokens);
+  // grafias de effort já vistas no Claude Code e em harnesses: output_config.effort (2.x) →
+  // reasoning.effort → effort → level → depth (numérico) → thinking.budget_tokens por faixa.
+  // A wire aceita os 5 níveis; o resolveModel valida e descarta o que não for um deles.
+  const cfgEffort = (() => {
+    for (const v of [body.output_config?.effort, body.reasoning?.effort, body.effort, body.level]) {
+      if (typeof v === "string" && EFFORT_LEVELS.includes(v)) return v;
+    }
+    if (body.depth != null) {
+      const n = typeof body.depth === "number" ? body.depth : Number(body.depth);
+      if (Number.isInteger(n)) return n <= 1 ? "low" : n === 2 ? "medium" : n === 3 ? "high" : "max";
+    }
+    return budgetTokensToEffort(body.thinking?.budget_tokens);
+  })();
   // sufixo de effort no id do modelo tem precedência sobre o esforço pedido no body
   const { id: model, effort: askedEffort } = resolveModel(body.model, cfgEffort);
   const reasoningEffort = thinkingType === "disabled" ? null : askedEffort;
@@ -299,7 +389,12 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
 
   // cliente sumiu (ctrl-C, timeout do harness) => cancela a geração upstream em vez de pagar por ela
   const ac = new AbortController();
-  res.on("close", () => { if (!res.writableEnded) ac.abort(); });
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let idleTimedOut = false;
+  res.on("close", () => {
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    if (!res.writableEnded) ac.abort();
+  });
 
   const start = Date.now();
   console.log(`[cc-proxy] (anthropic) ${body.model} → wire ${model}${reasoningEffort ? ` reasoning_effort=${reasoningEffort}` : ""}`);
@@ -315,6 +410,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   if (!upstream.ok) {
     const upstreamErr = await upstreamErrorMessage(upstream);
     const mapped = mapUpstreamError(upstream.status, upstreamErr);
+    setRetryAfter(res, mapped.status);
     anthropicError(res, mapped.status, `commandcode: ${upstreamErr}`, mapped.type);
     return true;
   }
@@ -328,7 +424,11 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   let sawToolUse = false;
 
   const stopFilter = makeStopFilter(stops);
-  const sendEvent = (type: string, data: object) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  let lastWrite = Date.now();
+  const sendEvent = (type: string, data: object) => {
+    res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+    lastWrite = Date.now();
+  };
 
   // máquina de estado dos blocos: um bloco fecha antes do próximo abrir, índices sequenciais
   let openBlock: { kind: "text" | "thinking"; index: number } | null = null;
@@ -367,6 +467,18 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     });
   }
 
+  // re-chunk do reasoning na saída: se a wire entregar um reasoning-delta gigante, fatiar em
+  // deltas pequenos com pacing — o cliente renderiza progressivo em vez de um bloco que salta.
+  async function appendThinking(text: string) {
+    if (!stream || Array.from(text).length <= THINK_CHUNK) { appendText("thinking", text); return; }
+    const chunks = chunkRunes(text, THINK_CHUNK);
+    appendText("thinking", chunks[0]);
+    for (const c of chunks.slice(1)) {
+      await new Promise((r) => setTimeout(r, THINK_DELAY));
+      appendText("thinking", c);
+    }
+  }
+
   function addToolUse(ev: WireToolCallEvent) {
     let raw = ev.input ?? ev.args ?? {};
     if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { raw = {}; } }
@@ -393,45 +505,66 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   }
 
   async function handleStream(readable: ReadableStream<Uint8Array>) {
-    for await (const ev of readEvents(readable)) {
-      switch (ev.type) {
-        case "text-delta": {
-          const { emit, hit } = stopFilter.push(ev.text ?? "");
-          if (emit) appendText("text", emit);
-          if (hit) { stopSequence = hit; ac.abort(); return; }
-          break;
+    // idle watchdog por leitura: cada byte do upstream renova o deadline; nenhum byte por
+    // CC_IDLE_TIMEOUT_MS = stream pendurado => cancela (em vez de pendurar a request 10 min).
+    let lastByteAt = Date.now();
+    const idleTimer = setInterval(() => {
+      if (Date.now() - lastByteAt >= UPSTREAM_IDLE_TIMEOUT_MS) { idleTimedOut = true; ac.abort(); }
+    }, 1000);
+    try {
+      for await (const ev of readEvents(readable, { onChunk: () => { lastByteAt = Date.now(); } })) {
+        switch (ev.type) {
+          case "text-delta": {
+            const { emit, hit } = stopFilter.push(ev.text ?? "");
+            if (emit) appendText("text", emit);
+            if (hit) { stopSequence = hit; ac.abort(); return; }
+            break;
+          }
+          case "reasoning-delta": {
+            // só vira bloco thinking se o request pediu thinking (a assinatura não é replayable)
+            if (!wantThinking) break;
+            const text = ev.text ?? "";
+            if (text) await appendThinking(text);
+            break;
+          }
+          case "tool-call": {
+            // tool executada pelo próprio servidor (web_search/web_fetch): não vira tool_use
+            if (ev.providerExecuted === true) break;
+            addToolUse(ev);
+            break;
+          }
+          case "finish":
+            finalUsage = ev.totalUsage ?? null;
+            wireFinish = ev.finishReason ?? ev.rawFinishReason ?? "end_turn";
+            break;
+          case "error": {
+            const err = ev.error;
+            const message = (typeof err === "string" ? err : err?.message) ?? "erro no stream do commandcode";
+            throw new StreamError(message, (typeof err === "string" ? undefined : err?.statusCode) ?? 500);
+          }
+          case "abort":
+            throw new StreamError("geração abortada pelo commandcode", 502);
         }
-        case "reasoning-delta": {
-          // só vira bloco thinking se o request pediu thinking (a assinatura não é replayable)
-          if (!wantThinking) break;
-          const text = ev.text ?? "";
-          if (text) appendText("thinking", text);
-          break;
-        }
-        case "tool-call": {
-          // tool executada pelo próprio servidor (web_search/web_fetch): não vira tool_use
-          if (ev.providerExecuted === true) break;
-          addToolUse(ev);
-          break;
-        }
-        case "finish":
-          finalUsage = ev.totalUsage ?? null;
-          wireFinish = ev.finishReason ?? ev.rawFinishReason ?? "end_turn";
-          break;
-        case "error": {
-          const err = ev.error;
-          const message = (typeof err === "string" ? err : err?.message) ?? "erro no stream do commandcode";
-          throw new StreamError(message, (typeof err === "string" ? undefined : err?.statusCode) ?? 500);
-        }
-        case "abort":
-          throw new StreamError("geração abortada pelo commandcode", 502);
       }
+    } finally {
+      clearInterval(idleTimer);
     }
   }
 
   // ---------- stream (SSE) ----------
   if (stream) {
     sseHead(res);
+    // keepalive: mesmo heartbeat da Messages API real; mantém o stream vivo durante pausas
+    // longas de reasoning (proxies/timeouts de idle na camada de rede).
+    pingTimer = setInterval(() => {
+      if (Date.now() - lastWrite < PING_MS) return; // só se nada foi escrito no último tick
+      try {
+        res.write(`event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`);
+        lastWrite = Date.now();
+      } catch {
+        if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+      }
+    }, PING_MS);
     sendEvent("message_start", {
       type: "message_start",
       message: {
@@ -455,9 +588,20 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
         usage: usageOf(finalUsage),
       });
       sendEvent("message_stop", { type: "message_stop" });
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       res.end();
       console.log(`[cc-proxy] (anthropic) ${model} stream ok ${Math.round(Date.now() - start)}ms`);
     } catch (e) {
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+      if (idleTimedOut) {
+        // upstream travou: erro visível no cliente em vez de stream truncado silencioso
+        try {
+          sendEvent("error", { type: "error", error: { type: "api_error", message: "commandcode: stream idle timeout" } });
+          res.end();
+        } catch {}
+        console.error(`[cc-proxy] (anthropic) ${model} stream idle timeout`);
+        return true;
+      }
       if (ac.signal.aborted && !stopSequence) { try { res.end(); } catch {} return true; }
       // erro no meio do stream: evento `error` e encerra SEM message_stop — é o que faz o SDK
       // lançar em vez de tratar como sucesso truncado.
@@ -475,8 +619,10 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   try {
     await handleStream(upstream.body!);
   } catch (e) {
+    if (idleTimedOut) { anthropicError(res, 504, "commandcode: stream idle timeout", "api_error"); return true; }
     if (ac.signal.aborted) return true;
     const mapped = mapUpstreamError(errStatus(e), errMessage(e));
+    setRetryAfter(res, mapped.status);
     anthropicError(res, mapped.status, `commandcode: ${errMessage(e)}`, mapped.type);
     return true;
   }
