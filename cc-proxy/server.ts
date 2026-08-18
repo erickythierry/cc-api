@@ -3,15 +3,18 @@
 // Sem auth local, bind em loopback. Só converte o wire. Ver README.md.
 
 import { createServer } from "node:http";
+import type { IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 
-import { DEFAULT_MODEL } from "./models.mjs";
-import { API_BASE, API_KEY, json } from "./upstream.mjs";
-import * as openai from "./openai.mjs";
-import * as anthropic from "./anthropic.mjs";
+import { DEFAULT_MODEL } from "./models.ts";
+import { API_BASE, API_KEY, json } from "./upstream.ts";
+import * as openai from "./openai.ts";
+import * as anthropic from "./anthropic.ts";
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1"; // key sem auth: loopback por padrão
+
+type Dialect = "openai" | "anthropic";
 
 if (!API_KEY) {
   console.error("[cc-proxy] Sem API key. Export COMMAND_CODE_API_KEY ou rode `command-code login`.");
@@ -21,7 +24,7 @@ if (!API_KEY) {
 // `/v1/messages` só existe no Anthropic e `/v1/chat/completions` só no OpenAI; o conflito é
 // `/v1/models`, que existe nos dois com shapes diferentes. Prefixo explícito decide; sem
 // prefixo, header de request Anthropic (`anthropic-version`/`x-api-key`) decide.
-function pickDialect(req, path) {
+function pickDialect(req: IncomingMessage, path: string): Dialect {
   if (path === "/v1/messages" || path.startsWith("/v1/messages/")) return "anthropic";
   if (path === "/v1/chat/completions" || path === "/v1/completions") return "openai";
   if (req.headers["anthropic-version"] || req.headers["x-api-key"]) return "anthropic";
@@ -29,7 +32,7 @@ function pickDialect(req, path) {
 }
 
 const server = createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
   let path = url.pathname;
   const sessionId = randomUUID();
 
@@ -51,7 +54,7 @@ const server = createServer(async (req, res) => {
   }
 
   // prefixos determinísticos: os dois SDKs montam `${baseURL}/v1/...`
-  let forced = null;
+  let forced: Dialect | null = null;
   if (path === "/openai" || path.startsWith("/openai/")) { forced = "openai"; path = path.slice("/openai".length) || "/"; }
   else if (path === "/anthropic" || path.startsWith("/anthropic/")) { forced = "anthropic"; path = path.slice("/anthropic".length) || "/"; }
 

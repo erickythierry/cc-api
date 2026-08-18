@@ -3,23 +3,26 @@
   "version": "1.0.0",
   "description": "Proxy local que expõe a API do commandcode (api.commandcode.ai) nos formatos OpenAI (/v1/chat/completions) e Anthropic (/v1/messages).",
   "type": "module",
-  "main": "server.mjs",
+  "main": "server.ts",
   "bin": {
-    "cc-proxy": "./server.mjs"
+    "cc-proxy": "./server.ts"
   },
   "scripts": {
-    "start": "node server.mjs",
+    "start": "node server.ts",
+    "typecheck": "tsc --noEmit",
     "test": "node test.mjs",
     "test:mock": "node test.mjs --mock",
     "test:anthropic": "node test.mjs --anthropic",
     "test:openai": "node test.mjs --openai"
   },
   "engines": {
-    "node": ">=18.17"
+    "node": ">=22.18"
   },
   "license": "MIT",
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
-    "openai": "^7.5.0"
+    "@types/node": "^24.10.0",
+    "openai": "^7.5.0",
+    "typescript": "^5.9.0"
   }
 }

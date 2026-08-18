@@ -39,17 +39,20 @@ new Anthropic({ baseURL: "http://127.0.0.1:8787" })           // também funcion
 
 ## Requisitos
 
-- Node >= 18.17 (usa `fetch` nativo)
+- Node >= 22.18 (roda os `.ts` direto, sem build: type stripping nativo; e `fetch` nativo)
 - Conta commandcode logada: `command-code login` já rodado **ou** env `COMMAND_CODE_API_KEY`
 
 ## Instalação e uso
 
 ```bash
-npm install        # sem deps — só registra scripts
+npm install        # sem deps de runtime — typescript/@types/node e os SDKs são só devDependencies
 PORT=8787 npm start
 # ou:
-node server.mjs
+node server.ts
 ```
+
+O código-fonte é TypeScript e o Node executa direto (apaga os tipos em memória, sem `tsc`, sem
+`dist/`). Checagem de tipos: `npm run typecheck`.
 
 Ver `http://localhost:8787/healthz`.
 
@@ -193,6 +196,7 @@ npm test                # conformidade (mock, sem custo) + SDKs + testes reais (
 npm run test:mock       # só conformidade + SDKs contra o mock — não toca em api.commandcode.ai
 npm run test:anthropic  # só o dialeto Anthropic
 npm run test:openai     # só o dialeto OpenAI
+npm run typecheck       # tsc --noEmit (só checa tipos, não emite nada)
 ```
 
 Estado atual: **178 ok, 0 falhou** (131 no modo `--mock`).
@@ -207,11 +211,12 @@ contra a API real: create, stream + `finalMessage()`, round-trip de tool e erros
 ## Arquivos
 
 ```
-server.mjs      # boot, roteador HTTP, CORS
-upstream.mjs    # tudo que fala com o commandcode (comum aos dois dialetos)
-openai.mjs      # handlers do dialeto OpenAI
-anthropic.mjs   # handlers do dialeto Anthropic
-models.mjs      # catálogo de modelos
+server.ts       # boot, roteador HTTP, CORS
+upstream.ts     # tudo que fala com o commandcode (comum aos dois dialetos)
+openai.ts       # handlers do dialeto OpenAI
+anthropic.ts    # handlers do dialeto Anthropic
+models.ts       # catálogo de modelos
+tsconfig.json   # strict + erasableSyntaxOnly (só sintaxe que o Node consegue apagar)
 test.mjs        # suite única (mock + SDKs + reais), com seções por dialeto
 ```
 
@@ -235,7 +240,7 @@ pergunta curta e devolve o comportamento de assistente genérico.
 
 ## Modelos e reasoning effort
 
-Catálogo em `models.mjs` (extraído do bundle `command-code@1.27.1`). Plano **Go** libera
+Catálogo em `models.ts` (extraído do bundle `command-code@1.27.1`). Plano **Go** libera
 opensource (`cai`): deepseek, Kimi, GLM, MiniMax, Qwen, mimo (visão), etc. Modelo premium
 (Claude/GPT) no plano Go devolve `model_not_in_plan` do upstream — o proxy repassa como
 `404 model_not_found`, igual à OpenAI.

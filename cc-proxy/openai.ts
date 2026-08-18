@@ -1,20 +1,54 @@
 // Dialeto OpenAI: /v1/chat/completions, /v1/models, /v1/models/{id}.
-// Comportamento idêntico ao da versão monolítica anterior (server.mjs).
+// Comportamento idêntico ao da versão .mjs anterior.
 
 import { randomBytes } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { MODELS, DEFAULT_MODEL, resolveModel, EFFORT_LEVELS } from "./models.mjs";
+import { MODELS, DEFAULT_MODEL, resolveModel, EFFORT_LEVELS, type Model } from "./models.ts";
 import {
   DEFAULT_SYSTEM, MAX_TOKENS,
   buildGenerateBody, callUpstream, classifyUpstreamError, contentToText,
-  imageUrlToDataUri, json, makeStopFilter, readBody, readEvents, sseHead,
-  toWireTools, upstreamErrorMessage,
-} from "./upstream.mjs";
+  errMessage, errStatus, imageUrlToDataUri, json, makeStopFilter, readBody, readEvents,
+  sseHead, StreamError, toWireTools, upstreamErrorMessage,
+  type ErrorKind, type WireMessage, type WirePart, type WireUsage,
+} from "./upstream.ts";
 
 const BOOT = Math.floor(Date.now() / 1000);
 
+// ---------- shapes do request OpenAI (só o que o proxy lê) ----------
+interface OpenAIToolCall {
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+}
+
+interface OpenAIMessage {
+  role?: string;
+  content?: string | any[] | null;
+  tool_calls?: OpenAIToolCall[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+interface ChatBody {
+  model?: string;
+  messages?: OpenAIMessage[];
+  n?: number;
+  stream?: boolean;
+  stream_options?: { include_usage?: boolean };
+  stop?: string | string[];
+  reasoning_effort?: string;
+  temperature?: unknown;
+  top_p?: unknown;
+  max_tokens?: number;
+  max_completion_tokens?: number;
+  tools?: unknown;
+  tool_choice?: any;
+  response_format?: any;
+}
+
 // kind neutro do upstream -> type/code do OpenAI
-const ERROR_MAP = {
+const ERROR_MAP: Record<ErrorKind, { type: string; code: string | null }> = {
   rate_limit: { type: "rate_limit_exceeded", code: "rate_limit_exceeded" },
   auth: { type: "invalid_request_error", code: "invalid_api_key" },
   permission: { type: "invalid_request_error", code: "permission_denied" },
@@ -22,23 +56,30 @@ const ERROR_MAP = {
   invalid: { type: "invalid_request_error", code: null },
   upstream: { type: "upstream_error", code: null },
 };
-function mapUpstreamError(status, message) {
+function mapUpstreamError(status: number, message: string) {
   const { kind, status: mapped } = classifyUpstreamError(status, message);
   return { status: mapped, ...ERROR_MAP[kind] };
 }
 
-export function openAiError(res, status, message, type = "invalid_request_error", code = null, param = null) {
+export function openAiError(
+  res: ServerResponse,
+  status: number,
+  message: string,
+  type = "invalid_request_error",
+  code: string | null = null,
+  param: string | null = null,
+): void {
   json(res, status, { error: { message, type, param, code } });
 }
 
-function modelObject(m) {
+function modelObject(m: Model) {
   return { id: m.id, object: "model", created: BOOT, owned_by: "commandcode", context_length: m.context ?? null };
 }
 
 // ---------- conversão OpenAI -> wire do commandcode ----------
 // monta mapa tool_call_id -> nome a partir de mensagens assistant anteriores
-function buildToolNameMap(messages) {
-  const map = new Map();
+function buildToolNameMap(messages: OpenAIMessage[]): Map<string, string> {
+  const map = new Map<string, string>();
   for (const msg of messages) {
     if (msg?.role === "assistant" && Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
@@ -49,15 +90,15 @@ function buildToolNameMap(messages) {
   return map;
 }
 
-async function toWireMessages(messages) {
+async function toWireMessages(messages: OpenAIMessage[]): Promise<WireMessage[]> {
   const toolName = buildToolNameMap(messages);
-  const wire = [];
+  const wire: WireMessage[] = [];
   for (const msg of messages) {
     if (!msg) continue;
     const role = msg.role;
     if (role === "system" || role === "developer") continue; // vai pro campo system
     if (role === "user") {
-      const parts = [];
+      const parts: WirePart[] = [];
       if (typeof msg.content === "string") {
         if (msg.content) parts.push({ type: "text", text: msg.content });
       } else if (Array.isArray(msg.content)) {
@@ -71,7 +112,7 @@ async function toWireMessages(messages) {
       continue;
     }
     if (role === "assistant") {
-      const parts = [];
+      const parts: WirePart[] = [];
       if (typeof msg.content === "string" && msg.content) {
         parts.push({ type: "text", text: msg.content });
       } else if (Array.isArray(msg.content)) {
@@ -81,12 +122,12 @@ async function toWireMessages(messages) {
       }
       if (Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
-          let input;
+          let input: unknown;
           try { input = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; }
           catch { input = { _raw: tc.function?.arguments }; }
           parts.push({
             type: "tool-call",
-            toolCallId: tc.id,
+            toolCallId: tc.id as string,
             toolName: tc.function?.name ?? "unknown",
             input,
           });
@@ -102,7 +143,7 @@ async function toWireMessages(messages) {
         content: [{
           type: "tool-result",
           toolCallId: msg.tool_call_id ?? "",
-          toolName: msg.name ?? toolName.get(msg.tool_call_id) ?? "unknown",
+          toolName: msg.name ?? toolName.get(msg.tool_call_id ?? "") ?? "unknown",
           output: { type: "text", value: typeof msg.content === "string" ? msg.content : contentToText(msg.content) },
         }],
       });
@@ -117,8 +158,8 @@ async function toWireMessages(messages) {
 
 // A wire não expõe response_format nem tool_choice; viram instrução no system (best-effort,
 // mesmo caminho que LiteLLM usa para provedores sem suporte nativo).
-function extraSystemInstructions(body) {
-  const out = [];
+function extraSystemInstructions(body: ChatBody): string[] {
+  const out: string[] = [];
   const rf = body.response_format;
   if (rf?.type === "json_object") {
     out.push("Responda EXCLUSIVAMENTE com um único objeto JSON válido. Sem texto fora do JSON, sem blocos de markdown.");
@@ -138,7 +179,7 @@ function extraSystemInstructions(body) {
 // ---------- conversão wire do commandcode -> OpenAI ----------
 function chatId() { return `chatcmpl-${randomBytes(12).toString("hex")}`; }
 
-function finishReasonOf(wireFinish) {
+function finishReasonOf(wireFinish: string): string {
   switch (wireFinish) {
     case "tool-calls": case "tool_calls": return "tool_calls";
     case "length": case "max_tokens": return "length";
@@ -147,7 +188,7 @@ function finishReasonOf(wireFinish) {
   }
 }
 
-function usageOf(u) {
+function usageOf(u: WireUsage | null) {
   if (!u) return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   const prompt = u.inputTokens ?? 0;
   const completion = u.outputTokens ?? 0;
@@ -162,9 +203,11 @@ function usageOf(u) {
   };
 }
 
+interface PendingToolCall { index: number; id: string; name: string; arguments: string }
+
 // ---------- handler ----------
 // devolve true se tratou a rota, false se ela não é do dialeto OpenAI
-export async function handle(req, res, path, sessionId) {
+export async function handle(req: IncomingMessage, res: ServerResponse, path: string, sessionId: string): Promise<boolean> {
   if (req.method === "GET" && path === "/v1/models") {
     json(res, 200, { object: "list", data: MODELS.map(modelObject) });
     return true;
@@ -181,9 +224,9 @@ export async function handle(req, res, path, sessionId) {
 
   if (!(req.method === "POST" && path === "/v1/chat/completions")) return false;
 
-  let body;
+  let body: ChatBody;
   try {
-    body = JSON.parse(await readBody(req));
+    body = JSON.parse(await readBody(req)) as ChatBody;
   } catch {
     openAiError(res, 400, "Requisição não é JSON válido.");
     return true;
@@ -204,7 +247,7 @@ export async function handle(req, res, path, sessionId) {
   const { id: model, effort: modelEffort } = resolveModel(requestedModel);
   // reasoning_effort explícito no body (OpenAI padrão) só vale se o id do modelo não já fixou via sufixo
   const bodyEffort = typeof body.reasoning_effort === "string" ? body.reasoning_effort.toLowerCase() : null;
-  const reasoningEffort = modelEffort ?? (EFFORT_LEVELS.includes(bodyEffort) ? bodyEffort : null);
+  const reasoningEffort = modelEffort ?? (bodyEffort && EFFORT_LEVELS.includes(bodyEffort) ? bodyEffort : null);
   const stream = body.stream === true;
   const includeUsage = body.stream_options?.include_usage === true;
   const stops = (typeof body.stop === "string" ? [body.stop] : Array.isArray(body.stop) ? body.stop : [])
@@ -219,11 +262,11 @@ export async function handle(req, res, path, sessionId) {
     ...extraSystemInstructions(body),
   ].join("\n\n") || DEFAULT_SYSTEM;
 
-  let wireMessages;
+  let wireMessages: WireMessage[];
   try {
     wireMessages = await toWireMessages(messages);
   } catch (e) {
-    openAiError(res, 400, e.message);
+    openAiError(res, 400, errMessage(e));
     return true;
   }
   if (!wireMessages.length) {
@@ -248,12 +291,12 @@ export async function handle(req, res, path, sessionId) {
 
   const start = Date.now();
   console.log(`[cc-proxy] ${requestedModel} → wire ${model}${reasoningEffort ? ` reasoning_effort=${reasoningEffort}` : ""}`);
-  let upstream;
+  let upstream: Response;
   try {
     upstream = await callUpstream(generateBody, ac.signal, sessionId);
   } catch (e) {
     if (ac.signal.aborted) return true;
-    openAiError(res, 502, `Falha ao conectar no commandcode: ${e.message}`, "upstream_error");
+    openAiError(res, 502, `Falha ao conectar no commandcode: ${errMessage(e)}`, "upstream_error");
     return true;
   }
 
@@ -267,15 +310,15 @@ export async function handle(req, res, path, sessionId) {
   // ----- parse do stream NDJSON do commandcode -----
   const id = chatId();
   const created = Math.floor(Date.now() / 1000);
-  const textParts = [];
-  const reasoningParts = [];
-  const toolCalls = []; // {index, id, name, arguments}
-  let finalUsage = null;
+  const textParts: string[] = [];
+  const reasoningParts: string[] = [];
+  const toolCalls: PendingToolCall[] = [];
+  let finalUsage: WireUsage | null = null;
   let wireFinish = "stop";
   let stoppedBySequence = false;
 
   const base = { id, object: "chat.completion.chunk", created, model, system_fingerprint: null };
-  const sendChunk = (chunk) => res.write(`data: ${JSON.stringify(includeUsage ? { usage: null, ...chunk } : chunk)}\n\n`);
+  const sendChunk = (chunk: object) => res.write(`data: ${JSON.stringify(includeUsage ? { usage: null, ...chunk } : chunk)}\n\n`);
   const stopFilter = makeStopFilter(stops);
   let sentRole = false;
   const ensureRole = () => {
@@ -285,7 +328,7 @@ export async function handle(req, res, path, sessionId) {
   };
 
   // consome o NDJSON do commandcode: atualiza estado e, se stream, emite SSE
-  async function handleStream(readable) {
+  async function handleStream(readable: ReadableStream<Uint8Array>) {
     for await (const ev of readEvents(readable)) {
       switch (ev.type) {
         case "text-delta": {
@@ -310,7 +353,7 @@ export async function handle(req, res, path, sessionId) {
           if (ev.providerExecuted === true) break;
           const idx = toolCalls.length;
           const input = ev.input ?? ev.args ?? {};
-          const tc = {
+          const tc: PendingToolCall = {
             index: idx,
             id: ev.toolCallId ?? `call_${idx}`,
             name: ev.toolName ?? "unknown",
@@ -341,15 +384,12 @@ export async function handle(req, res, path, sessionId) {
           wireFinish = ev.finishReason ?? ev.rawFinishReason ?? "stop";
           break;
         case "error": {
-          const err = new Error(ev.error?.message ?? (typeof ev.error === "string" ? ev.error : "erro no stream do commandcode"));
-          err.statusCode = ev.error?.statusCode ?? 500;
-          throw err;
+          const err = ev.error;
+          const message = (typeof err === "string" ? err : err?.message) ?? "erro no stream do commandcode";
+          throw new StreamError(message, (typeof err === "string" ? undefined : err?.statusCode) ?? 500);
         }
-        case "abort": {
-          const err = new Error("geração abortada pelo commandcode");
-          err.statusCode = 502;
-          throw err;
-        }
+        case "abort":
+          throw new StreamError("geração abortada pelo commandcode", 502);
       }
     }
   }
@@ -359,7 +399,7 @@ export async function handle(req, res, path, sessionId) {
     sseHead(res);
 
     try {
-      await handleStream(upstream.body);
+      await handleStream(upstream.body!);
       const tail = stopFilter.flush();
       if (tail && !stoppedBySequence) {
         textParts.push(tail);
@@ -377,23 +417,23 @@ export async function handle(req, res, path, sessionId) {
       if (ac.signal.aborted && !stoppedBySequence) { try { res.end(); } catch {} return true; }
       // erro no meio do stream: evento `error` e encerra SEM [DONE] — é assim que a OpenAI
       // sinaliza falha parcial, e é o que faz o SDK lançar em vez de tratar como sucesso.
-      const mapped = mapUpstreamError(e.statusCode ?? 500, e.message);
+      const mapped = mapUpstreamError(errStatus(e), errMessage(e));
       try {
-        res.write(`data: ${JSON.stringify({ error: { message: e.message, type: mapped.type, param: null, code: mapped.code } })}\n\n`);
+        res.write(`data: ${JSON.stringify({ error: { message: errMessage(e), type: mapped.type, param: null, code: mapped.code } })}\n\n`);
         res.end();
       } catch {}
-      console.error(`[cc-proxy] ${model} stream erro: ${e.message}`);
+      console.error(`[cc-proxy] ${model} stream erro: ${errMessage(e)}`);
     }
     return true;
   }
 
   // ---------- não-stream ----------
   try {
-    await handleStream(upstream.body);
+    await handleStream(upstream.body!);
   } catch (e) {
     if (ac.signal.aborted) return true;
-    const mapped = mapUpstreamError(e.statusCode ?? 500, e.message);
-    openAiError(res, mapped.status, `commandcode: ${e.message}`, mapped.type, mapped.code);
+    const mapped = mapUpstreamError(errStatus(e), errMessage(e));
+    openAiError(res, mapped.status, `commandcode: ${errMessage(e)}`, mapped.type, mapped.code);
     return true;
   }
   if (!stoppedBySequence) textParts.push(stopFilter.flush());

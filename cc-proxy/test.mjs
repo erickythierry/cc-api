@@ -91,7 +91,7 @@ const mock = createServer(async (req, res) => {
 });
 
 function startProxy(port, extraEnv) {
-  const p = spawn(process.execPath, [join(__dirname, "server.mjs")], {
+  const p = spawn(process.execPath, [join(__dirname, "server.ts")], {
     env: { ...process.env, PORT: String(port), ...extraEnv }, stdio: ["ignore", "pipe", "pipe"],
   });
   p.stdout.on("data", (d) => process.env.VERBOSE && process.stdout.write(`[${port}] ${d}`));

@@ -7,7 +7,22 @@
 
 export const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 
-const BASE = [
+// entrada do catálogo: base (`efforts` preenchido) ou variante de esforço (`base`/`effort`)
+export interface Model {
+  id: string;
+  context: number;
+  efforts?: string[];
+  base?: string;
+  effort?: string;
+}
+
+interface BaseModel {
+  id: string;
+  context: number;
+  efforts: string[];
+}
+
+const BASE: BaseModel[] = [
   { id: "deepseek/deepseek-v4-flash", context: 1000000, efforts: ["high", "max"] },
   { id: "deepseek/deepseek-v4-pro", context: 1000000, efforts: ["high", "max"] },
   { id: "moonshotai/Kimi-K2.5", context: 256000, efforts: [] },
@@ -39,7 +54,7 @@ const BASE = [
   { id: "thinkingmachines/inkling-small", context: 1000000, efforts: [] },
 ];
 
-function variants(b) {
+function variants(b: BaseModel): Model[] {
   return (b.efforts ?? []).map((effort) => ({
     id: `${b.id}-${effort}`,
     base: b.id,
@@ -48,16 +63,16 @@ function variants(b) {
   }));
 }
 
-export const MODELS = [
+export const MODELS: Model[] = [
   ...BASE.map((b) => ({ id: b.id, context: b.context, efforts: b.efforts ?? [] })),
   ...BASE.flatMap(variants),
 ];
 
 // resolve id de modelo: se tem sufixo de esforço, devolve base + effort
-export function resolveModel(id) {
+export function resolveModel(id: string): { id: string; effort: string | null } {
   const m = MODELS.find((x) => x.id === id);
-  if (m?.effort) return { id: m.base, effort: m.effort };
+  if (m?.effort) return { id: m.base as string, effort: m.effort };
   return { id, effort: null };
 }
 
-export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+export const EFFORT_LEVELS: string[] = ["low", "medium", "high", "xhigh", "max"];

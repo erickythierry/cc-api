@@ -19,11 +19,12 @@ Anthropic** (`/v1/messages`), lado a lado, pra qualquer harness que fale uma das
 ├── PLANO-ANTHROPIC.md    # plano de implementação do dialeto Anthropic (executado)
 ├── test-client.mjs       # client direto contra api.commandcode.ai (sem TUI) — teste cru do protocolo
 └── cc-proxy/             # ⭐ o projeto usável: proxy local OpenAI + Anthropic
-    ├── server.mjs        # boot, roteador HTTP, CORS (zero dependências de runtime, node:http)
-    ├── upstream.mjs      # camada comum: auth, wire do commandcode, SSE, erros
-    ├── openai.mjs        # dialeto OpenAI (/v1/chat/completions)
-    ├── anthropic.mjs     # dialeto Anthropic (/v1/messages, count_tokens)
-    ├── models.mjs        # catálogo de modelos
+    ├── server.ts         # boot, roteador HTTP, CORS (zero dependências de runtime, node:http)
+    ├── upstream.ts       # camada comum: auth, wire do commandcode, SSE, erros
+    ├── openai.ts         # dialeto OpenAI (/v1/chat/completions)
+    ├── anthropic.ts      # dialeto Anthropic (/v1/messages, count_tokens)
+    ├── models.ts         # catálogo de modelos
+    ├── tsconfig.json     # strict + erasableSyntaxOnly (Node roda os .ts sem build)
     ├── test.mjs          # suite de testes (mock + SDKs oficiais + reais)
     ├── package.json
     └── README.md         # doc de uso do proxy
@@ -69,7 +70,7 @@ sempre manda um `system`; medido: 7.750 → 97 tokens de input na mesma pergunta
 
 ## Modelos
 
-Default: `deepseek/deepseek-v4-flash`. Catálogo completo em `cc-proxy/models.mjs` (extraído do bundle `command-code@1.27.1`).
+Default: `deepseek/deepseek-v4-flash`. Catálogo completo em `cc-proxy/models.ts` (extraído do bundle `command-code@1.27.1`).
 Modelos com reasoning expõem variantes de esforço por sufixo no id — `deepseek/deepseek-v4-flash-max`,
 `-high`, `zai-org/GLM-5.3-low`, etc. — resolvidas no proxy e repassadas como `reasoning_effort` na wire.
 
@@ -84,5 +85,5 @@ Tudo documentado em [`PROTOCOLO.md`](./PROTOCOLO.md).
 
 ## Requisitos
 
-- Node >= 18.17 (`fetch` nativo)
+- Node >= 22.18 (roda os `.ts` do proxy sem build, via type stripping nativo; `fetch` nativo)
 - Conta commandcode com plano Go (ou superior) logada

@@ -2,19 +2,60 @@
 // /v1/models, /v1/models/{id}. Mesmo upstream (POST /alpha/generate) do dialeto OpenAI.
 
 import { randomBytes } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
-import { MODELS, resolveModel, EFFORT_LEVELS } from "./models.mjs";
+import { MODELS, resolveModel, EFFORT_LEVELS, type Model } from "./models.ts";
 import {
   DEFAULT_SYSTEM,
   buildGenerateBody, callUpstream, classifyUpstreamError,
-  imageUrlToDataUri, json, makeStopFilter, readBody, readEvents, sseHead,
-  toWireTools, upstreamErrorMessage,
-} from "./upstream.mjs";
+  errMessage, errStatus, imageUrlToDataUri, json, makeStopFilter, readBody, readEvents,
+  sseHead, StreamError, toWireTools, upstreamErrorMessage,
+  type ErrorKind, type WireImage, type WireMessage, type WirePart, type WireToolCallEvent, type WireUsage,
+} from "./upstream.ts";
 
 const BOOT_ISO = new Date().toISOString();
 
+// ---------- shapes do request Anthropic (só o que o proxy lê) ----------
+interface AnthropicBlock {
+  type?: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+  tool_use_id?: string;
+  content?: unknown;
+  is_error?: boolean;
+  source?: { type?: string; media_type?: string; data?: string; url?: string };
+}
+
+interface AnthropicMessage {
+  role?: string;
+  content?: string | AnthropicBlock[] | null;
+}
+
+interface MessagesBody {
+  model?: string;
+  messages?: AnthropicMessage[];
+  system?: string | AnthropicBlock[];
+  max_tokens?: number;
+  temperature?: unknown;
+  top_p?: unknown;
+  stream?: boolean;
+  stop_sequences?: string[];
+  tools?: unknown;
+  tool_choice?: { type?: string; name?: string };
+  thinking?: { type?: string };
+  output_config?: { effort?: string };
+}
+
+// blocos de conteúdo devolvidos ao cliente
+type OutBlock =
+  | { type: "text"; text: string }
+  | { type: "thinking"; thinking: string; signature: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
+
 // kind neutro do upstream -> error.type do Anthropic
-const ERROR_MAP = {
+const ERROR_MAP: Record<ErrorKind, string> = {
   rate_limit: "rate_limit_error",
   auth: "authentication_error",
   permission: "permission_error",
@@ -22,49 +63,49 @@ const ERROR_MAP = {
   invalid: "invalid_request_error",
   upstream: "api_error",
 };
-function mapUpstreamError(status, message) {
+function mapUpstreamError(status: number, message: string) {
   const { kind, status: mapped } = classifyUpstreamError(status, message);
   return { status: mapped, type: ERROR_MAP[kind] };
 }
 
-const hex = (n) => randomBytes(n).toString("hex");
+const hex = (n: number) => randomBytes(n).toString("hex");
 const messageId = () => `msg_${hex(12)}`;
 const toolUseId = () => `toolu_${hex(12)}`;
 const requestId = () => `req_${hex(12)}`;
 
-export function anthropicError(res, status, message, type = "invalid_request_error") {
+export function anthropicError(res: ServerResponse, status: number, message: string, type = "invalid_request_error"): void {
   json(res, status, { type: "error", error: { type, message }, request_id: requestId() });
 }
 
-function modelObject(m) {
+function modelObject(m: Model) {
   return { id: m.id, type: "model", display_name: m.id.split("/").pop(), created_at: BOOT_ISO };
 }
 
 // ---------- request Anthropic -> wire do commandcode ----------
-function systemOf(body) {
+function systemOf(body: MessagesBody): string {
   const s = body.system;
   let text = "";
   if (typeof s === "string") text = s;
   else if (Array.isArray(s)) {
-    text = s.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n\n");
+    text = s.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n\n");
   }
   // a wire não tem tool_choice; vira instrução no system (best-effort)
-  const extra = [];
+  const extra: string[] = [];
   const tc = body.tool_choice;
   if (tc?.type === "any") extra.push("Você DEVE chamar pelo menos uma das ferramentas disponíveis nesta resposta.");
   else if (tc?.type === "tool" && tc.name) extra.push(`Você DEVE chamar a ferramenta \`${tc.name}\` nesta resposta.`);
   return [text.trim() ? text : DEFAULT_SYSTEM, ...extra].join("\n\n");
 }
 
-function toolResultText(content) {
+function toolResultText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    return content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n");
+    return content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n");
   }
   return "";
 }
 
-async function imageBlockToWire(block) {
+async function imageBlockToWire(block: AnthropicBlock): Promise<WireImage> {
   const src = block.source ?? {};
   if (src.type === "base64") {
     const mime = src.media_type || "image/png";
@@ -75,8 +116,8 @@ async function imageBlockToWire(block) {
 }
 
 // mapa tool_use_id -> nome, lido dos blocos tool_use das mensagens assistant anteriores
-function buildToolNameMap(messages) {
-  const map = new Map();
+function buildToolNameMap(messages: AnthropicMessage[]): Map<string, string> {
+  const map = new Map<string, string>();
   for (const msg of messages) {
     if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
     for (const b of msg.content) if (b?.type === "tool_use" && b.id) map.set(b.id, b.name ?? "unknown");
@@ -84,18 +125,18 @@ function buildToolNameMap(messages) {
   return map;
 }
 
-async function toWireMessages(messages) {
+async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage[]> {
   const toolName = buildToolNameMap(messages);
-  const wire = [];
+  const wire: WireMessage[] = [];
   for (const msg of messages) {
     if (!msg) continue;
     const raw = msg.content;
-    const blocks = typeof raw === "string"
+    const blocks: AnthropicBlock[] = typeof raw === "string"
       ? (raw ? [{ type: "text", text: raw }] : [])
       : Array.isArray(raw) ? raw : [];
 
     if (msg.role === "assistant") {
-      const parts = [];
+      const parts: WirePart[] = [];
       for (const b of blocks) {
         if (!b) continue;
         if (b.type === "text" && b.text) parts.push({ type: "text", text: b.text });
@@ -115,8 +156,8 @@ async function toWireMessages(messages) {
     }
 
     // user (e qualquer role desconhecido): tool_result vira mensagem wire `tool`, o resto vira `user`
-    const toolResults = [];
-    const rest = [];
+    const toolResults: WirePart[] = [];
+    const rest: WirePart[] = [];
     for (const b of blocks) {
       if (!b) continue;
       if (b.type === "tool_result") {
@@ -124,7 +165,7 @@ async function toWireMessages(messages) {
         toolResults.push({
           type: "tool-result",
           toolCallId: b.tool_use_id ?? "",
-          toolName: toolName.get(b.tool_use_id) ?? "unknown",
+          toolName: toolName.get(b.tool_use_id ?? "") ?? "unknown",
           // a wire não tem flag de erro no tool-result
           output: { type: "text", value: b.is_error === true ? `Error: ${value}` : value },
         });
@@ -142,7 +183,7 @@ async function toWireMessages(messages) {
   return wire;
 }
 
-function usageOf(u) {
+function usageOf(u: WireUsage | null) {
   if (!u) return { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   return {
     input_tokens: u.inputTokens ?? 0,
@@ -154,7 +195,7 @@ function usageOf(u) {
 
 // ---------- handler ----------
 // devolve true se tratou a rota, false se ela não é do dialeto Anthropic
-export async function handle(req, res, path, sessionId) {
+export async function handle(req: IncomingMessage, res: ServerResponse, path: string, sessionId: string): Promise<boolean> {
   if (req.method === "GET" && path === "/v1/models") {
     const data = MODELS.map(modelObject);
     json(res, 200, { data, has_more: false, first_id: data[0]?.id ?? null, last_id: data.at(-1)?.id ?? null });
@@ -172,8 +213,8 @@ export async function handle(req, res, path, sessionId) {
   // estimativa local: a wire do commandcode não expõe tokenizer nem endpoint de contagem.
   // ponytail: contagem por caracteres (~±25%); troca por contagem real se o upstream publicar uma.
   if (req.method === "POST" && path === "/v1/messages/count_tokens") {
-    let body;
-    try { body = JSON.parse(await readBody(req)); } catch { anthropicError(res, 400, "Requisição não é JSON válido."); return true; }
+    let body: MessagesBody;
+    try { body = JSON.parse(await readBody(req)) as MessagesBody; } catch { anthropicError(res, 400, "Requisição não é JSON válido."); return true; }
     const messages = Array.isArray(body.messages) ? body.messages.filter(Boolean) : null;
     if (!messages || !messages.length) {
       anthropicError(res, 400, "messages: at least one message is required");
@@ -186,9 +227,9 @@ export async function handle(req, res, path, sessionId) {
 
   if (!(req.method === "POST" && path === "/v1/messages")) return false;
 
-  let body;
+  let body: MessagesBody;
   try {
-    body = JSON.parse(await readBody(req));
+    body = JSON.parse(await readBody(req)) as MessagesBody;
   } catch {
     anthropicError(res, 400, "Requisição não é JSON válido.");
     return true;
@@ -199,7 +240,7 @@ export async function handle(req, res, path, sessionId) {
     anthropicError(res, 400, "model: field required");
     return true;
   }
-  if (!Number.isInteger(body.max_tokens) || body.max_tokens < 1) {
+  if (!Number.isInteger(body.max_tokens) || (body.max_tokens as number) < 1) {
     anthropicError(res, 400, "max_tokens: field required");
     return true;
   }
@@ -216,16 +257,16 @@ export async function handle(req, res, path, sessionId) {
   // sufixo de effort no id do modelo tem precedência sobre output_config.effort
   const reasoningEffort = thinkingType === "disabled"
     ? null
-    : (modelEffort ?? (EFFORT_LEVELS.includes(cfgEffort) ? cfgEffort : null));
+    : (modelEffort ?? (cfgEffort && EFFORT_LEVELS.includes(cfgEffort) ? cfgEffort : null));
   const stream = body.stream === true;
   const stops = (Array.isArray(body.stop_sequences) ? body.stop_sequences : [])
     .filter((s) => typeof s === "string" && s.length);
 
-  let wireMessages;
+  let wireMessages: WireMessage[];
   try {
     wireMessages = await toWireMessages(messages);
   } catch (e) {
-    anthropicError(res, 400, e.message);
+    anthropicError(res, 400, errMessage(e));
     return true;
   }
   if (!wireMessages.length) {
@@ -250,12 +291,12 @@ export async function handle(req, res, path, sessionId) {
 
   const start = Date.now();
   console.log(`[cc-proxy] (anthropic) ${body.model} → wire ${model}${reasoningEffort ? ` reasoning_effort=${reasoningEffort}` : ""}`);
-  let upstream;
+  let upstream: Response;
   try {
     upstream = await callUpstream(generateBody, ac.signal, sessionId);
   } catch (e) {
     if (ac.signal.aborted) return true;
-    anthropicError(res, 502, `Falha ao conectar no commandcode: ${e.message}`, "api_error");
+    anthropicError(res, 502, `Falha ao conectar no commandcode: ${errMessage(e)}`, "api_error");
     return true;
   }
 
@@ -268,17 +309,17 @@ export async function handle(req, res, path, sessionId) {
 
   // ----- estado da resposta -----
   const id = messageId();
-  const content = []; // blocos finais, na ordem em que chegaram
-  let finalUsage = null;
+  const content: OutBlock[] = []; // blocos finais, na ordem em que chegaram
+  let finalUsage: WireUsage | null = null;
   let wireFinish = "end_turn";
-  let stopSequence = null;
+  let stopSequence: string | null = null;
   let sawToolUse = false;
 
   const stopFilter = makeStopFilter(stops);
-  const sendEvent = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  const sendEvent = (type: string, data: object) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
 
   // máquina de estado dos blocos: um bloco fecha antes do próximo abrir, índices sequenciais
-  let openBlock = null; // {kind:"text"|"thinking", index}
+  let openBlock: { kind: "text" | "thinking"; index: number } | null = null;
   let nextIndex = 0;
   function closeBlock() {
     if (!openBlock) return;
@@ -292,14 +333,11 @@ export async function handle(req, res, path, sessionId) {
     openBlock = null;
   }
 
-  function appendText(kind, text) {
+  function appendText(kind: "text" | "thinking", text: string) {
     const last = content[content.length - 1];
-    if (last && last.type === kind) {
-      if (kind === "text") last.text += text;
-      else last.thinking += text;
-    } else {
-      content.push(kind === "text" ? { type: "text", text } : { type: "thinking", thinking: text, signature: "" });
-    }
+    if (last && last.type === "text" && kind === "text") last.text += text;
+    else if (last && last.type === "thinking" && kind === "thinking") last.thinking += text;
+    else content.push(kind === "text" ? { type: "text", text } : { type: "thinking", thinking: text, signature: "" });
     if (!stream) return;
     if (!openBlock || openBlock.kind !== kind) {
       closeBlock();
@@ -317,10 +355,11 @@ export async function handle(req, res, path, sessionId) {
     });
   }
 
-  function addToolUse(ev) {
-    let input = ev.input ?? ev.args ?? {};
-    if (typeof input === "string") { try { input = JSON.parse(input); } catch { input = {}; } }
-    if (input === null || typeof input !== "object") input = {}; // tool_use.input é objeto, nunca string
+  function addToolUse(ev: WireToolCallEvent) {
+    let raw = ev.input ?? ev.args ?? {};
+    if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { raw = {}; } }
+    // tool_use.input é objeto, nunca string
+    const input: Record<string, unknown> = raw !== null && typeof raw === "object" ? raw as Record<string, unknown> : {};
     const toolId = ev.toolCallId ?? toolUseId();
     const name = ev.toolName ?? "unknown";
     content.push({ type: "tool_use", id: toolId, name, input });
@@ -341,7 +380,7 @@ export async function handle(req, res, path, sessionId) {
     return "end_turn";
   }
 
-  async function handleStream(readable) {
+  async function handleStream(readable: ReadableStream<Uint8Array>) {
     for await (const ev of readEvents(readable)) {
       switch (ev.type) {
         case "text-delta": {
@@ -368,15 +407,12 @@ export async function handle(req, res, path, sessionId) {
           wireFinish = ev.finishReason ?? ev.rawFinishReason ?? "end_turn";
           break;
         case "error": {
-          const err = new Error(ev.error?.message ?? (typeof ev.error === "string" ? ev.error : "erro no stream do commandcode"));
-          err.statusCode = ev.error?.statusCode ?? 500;
-          throw err;
+          const err = ev.error;
+          const message = (typeof err === "string" ? err : err?.message) ?? "erro no stream do commandcode";
+          throw new StreamError(message, (typeof err === "string" ? undefined : err?.statusCode) ?? 500);
         }
-        case "abort": {
-          const err = new Error("geração abortada pelo commandcode");
-          err.statusCode = 502;
-          throw err;
-        }
+        case "abort":
+          throw new StreamError("geração abortada pelo commandcode", 502);
       }
     }
   }
@@ -395,7 +431,7 @@ export async function handle(req, res, path, sessionId) {
     });
 
     try {
-      await handleStream(upstream.body);
+      await handleStream(upstream.body!);
       if (!stopSequence) {
         const tail = stopFilter.flush();
         if (tail) appendText("text", tail);
@@ -413,23 +449,23 @@ export async function handle(req, res, path, sessionId) {
       if (ac.signal.aborted && !stopSequence) { try { res.end(); } catch {} return true; }
       // erro no meio do stream: evento `error` e encerra SEM message_stop — é o que faz o SDK
       // lançar em vez de tratar como sucesso truncado.
-      const mapped = mapUpstreamError(e.statusCode ?? 500, e.message);
+      const mapped = mapUpstreamError(errStatus(e), errMessage(e));
       try {
-        sendEvent("error", { type: "error", error: { type: mapped.type, message: e.message } });
+        sendEvent("error", { type: "error", error: { type: mapped.type, message: errMessage(e) } });
         res.end();
       } catch {}
-      console.error(`[cc-proxy] (anthropic) ${model} stream erro: ${e.message}`);
+      console.error(`[cc-proxy] (anthropic) ${model} stream erro: ${errMessage(e)}`);
     }
     return true;
   }
 
   // ---------- não-stream ----------
   try {
-    await handleStream(upstream.body);
+    await handleStream(upstream.body!);
   } catch (e) {
     if (ac.signal.aborted) return true;
-    const mapped = mapUpstreamError(e.statusCode ?? 500, e.message);
-    anthropicError(res, mapped.status, `commandcode: ${e.message}`, mapped.type);
+    const mapped = mapUpstreamError(errStatus(e), errMessage(e));
+    anthropicError(res, mapped.status, `commandcode: ${errMessage(e)}`, mapped.type);
     return true;
   }
   if (!stopSequence) {
