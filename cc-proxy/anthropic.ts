@@ -425,6 +425,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
 
   const stopFilter = makeStopFilter(stops);
   let lastWrite = Date.now();
+  let lastByteAt = Date.now(); // idle watchdog: renovado a cada byte do upstream e durante o re-chunk do thinking
   const sendEvent = (type: string, data: object) => {
     res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
     lastWrite = Date.now();
@@ -474,6 +475,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     const chunks = chunkRunes(text, THINK_CHUNK);
     appendText("thinking", chunks[0]);
     for (const c of chunks.slice(1)) {
+      lastByteAt = Date.now(); // o await do pacing pausa o readEvents; sem isso o idle watchdog abortaria durante o re-chunk
       await new Promise((r) => setTimeout(r, THINK_DELAY));
       appendText("thinking", c);
     }
@@ -507,7 +509,6 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   async function handleStream(readable: ReadableStream<Uint8Array>) {
     // idle watchdog por leitura: cada byte do upstream renova o deadline; nenhum byte por
     // CC_IDLE_TIMEOUT_MS = stream pendurado => cancela (em vez de pendurar a request 10 min).
-    let lastByteAt = Date.now();
     const idleTimer = setInterval(() => {
       if (Date.now() - lastByteAt >= UPSTREAM_IDLE_TIMEOUT_MS) { idleTimedOut = true; ac.abort(); }
     }, 1000);
