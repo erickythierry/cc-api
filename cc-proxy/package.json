@@ -1,7 +1,7 @@
 {
   "name": "commandcode-openai-proxy",
   "version": "1.0.0",
-  "description": "Proxy local OpenAI-compatible para a API do commandcode (api.commandcode.ai). Converte chat/completions OpenAI em /alpha/generate.",
+  "description": "Proxy local que expõe a API do commandcode (api.commandcode.ai) nos formatos OpenAI (/v1/chat/completions) e Anthropic (/v1/messages).",
   "type": "module",
   "main": "server.mjs",
   "bin": {
@@ -10,10 +10,16 @@
   "scripts": {
     "start": "node server.mjs",
     "test": "node test.mjs",
-    "test:mock": "node test.mjs --mock"
+    "test:mock": "node test.mjs --mock",
+    "test:anthropic": "node test.mjs --anthropic",
+    "test:openai": "node test.mjs --openai"
   },
   "engines": {
     "node": ">=18.17"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "openai": "^7.5.0"
+  }
 }
