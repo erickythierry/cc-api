@@ -104,6 +104,14 @@ Validação server-side (Zod, descoberta por tentativa e erro — 400 HINT):
 - `config.structure` = ls do cwd (sem `.` e sem node_modules etc) + labels `scope:<dir>`.
 - `gitStatus` default `"Working tree clean"` quando repo limpo.
 
+### `params.system` não é opcional na prática
+
+Sem `params.system`, o servidor injeta o **system prompt de agente do CLI**: ~7.6k tokens de
+input por request (medido: 7.642 de `inputTokens` com prompt de 5 palavras, contra 96 mandando
+um system próprio) e o modelo passa a se apresentar como agente de terminal com ferramentas de
+arquivo/bash. Vale para todos os `mode` — trocar `agent` por `title-gen`/`compact`/etc. não muda
+nada. Quem usa a wire fora do TUI deve sempre mandar `system`.
+
 ### Formato das mensagens (wire)
 
 - `assistant`: `{ role:"assistant", content:[ {type:"text",text} | {type:"tool-call",toolCallId,toolName,input} | {type:"reasoning",text} ] }`
@@ -130,6 +138,14 @@ Testado real (plano Go, deepseek-v4-flash): reasoning → texto → `finish` com
 `{inputTokens:97, outputTokens:78 (text 8 + reasoning 70), totalTokens:175}`.
 
 `finishReason` normalizado: `tool_calls`→`tool_calls`, `length`→`max_tokens`, senão `end_turn`.
+`totalUsage` traz também `inputTokenDetails.cacheReadTokens` / `cachedInputTokens` e
+`outputTokenDetails.reasoningTokens` — o prompt de agente injetado vem quase todo do cache.
+O stream fecha com `\n`, mas o parser não deve depender disso: a última linha carrega o `finish`
+(usage inteira).
+
+`tool-call` com `providerExecuted: true` é tool rodada pelo próprio servidor (`web_search`,
+`web_fetch`) — o `tool-result` correspondente já vem no stream, o cliente não deve tentar
+executá-la.
 
 ## Planos e modelos (server-side)
 

@@ -18,7 +18,7 @@ um proxy local que converte isso para **formato OpenAI**, pra qualquer harness q
 └── cc-proxy/             # ⭐ o projeto usável: proxy local OpenAI-compatible
     ├── server.mjs        # servidor (zero dependências, node:http)
     ├── models.mjs        # catálogo de modelos
-    ├── test.mjs          # suite de testes (20/20)
+    ├── test.mjs          # suite de testes (conformidade com mock + reais)
     ├── package.json
     └── README.md         # doc de uso do proxy
 ```
@@ -36,9 +36,21 @@ harness (OpenAI) ──► cc-proxy :8787 ──► api.commandcode.ai/alpha/gen
 
 ## Validação
 
-- Suite `npm test` (em `cc-proxy/`): **20/20** — chat não-stream, stream SSE, tool calls, multi-turn, system message, erros.
-- Teste com **SDK oficial `openai`**: **100%** — `chat.completions.create`, stream, `tool_calls`, `models.list`.
+- Suite `npm test` (em `cc-proxy/`): **61/61**. Duas partes:
+  - **conformidade** (`npm run test:mock`, sem custo) — upstream falso cobre erro no meio do stream,
+    HTTP 429/401/403, NDJSON sem newline final, tool executada pelo servidor, reasoning/cache,
+    `stop`, `include_usage`, validação local.
+  - **reais** contra `api.commandcode.ai` — chat, stream, tool calls, multi-turn, `response_format`,
+    variantes de effort, modelo inexistente.
+- Teste com **SDK oficial `openai`**: `chat.completions.create`, stream, `tool_calls`,
+  `models.list`, `models.retrieve`, erros tipados (`RateLimitError`, `NotFoundError`).
 - Plano Go = gate server-side: libera modelos opensource (deepseek, Kimi, GLM, MiniMax, Qwen...), bloqueia premium (Claude/GPT) com `model_not_in_plan`.
+
+### Pegadinha da wire: o system prompt implícito
+
+`/alpha/generate` sem `params.system` faz o servidor injetar o prompt de agente do CLI —
+**~7.6k tokens de input por chamada** e o modelo se apresenta como agente de terminal. O proxy
+sempre manda um `system`; medido: 7.750 → 97 tokens de input na mesma pergunta.
 
 ## Modelos
 
