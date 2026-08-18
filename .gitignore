@@ -1,0 +1,11 @@
+# dependências locais (instaladas para engenharia reversa)
+node_modules/
+package-lock.json
+
+# artefatos da extração do bundle
+pkg/
+command-code.tgz
+
+# logs e temporários
+*.log
+.DS_Store

@@ -1,0 +1,18 @@
+{
+  "name": "commandcode-openai-proxy",
+  "version": "1.0.0",
+  "description": "Proxy local OpenAI-compatible para a API do commandcode (api.commandcode.ai). Converte chat/completions OpenAI em /alpha/generate.",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "cc-proxy": "./server.mjs"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "license": "MIT"
+}
