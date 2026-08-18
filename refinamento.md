@@ -1,276 +1,253 @@
-# Refinamento — compatibilidade plena do cc-proxy com Claude Code (DeepSeek)
+# Refinamento do cc-proxy para Claude Code + DeepSeek
 
-Comparação criteriosa entre `routatic-proxy` (Go, referência de compatibilidade) e
-`cc-proxy` (este projeto, TS). Foco 100% em **DeepSeek flash/pro** via Claude Code.
+Reavaliação completa do `cc-proxy` contra o `routatic-proxy`, com foco exclusivo nos
+modelos `deepseek/deepseek-v4-flash` e `deepseek/deepseek-v4-pro` via Messages API do
+Claude Code.
 
-O routatic-proxy fala a Messages API nativamente para DeepSeek e faz **passthrough do
-body original**, só aplicando fixups. O cc-proxy converte para a wire do commandcode
-(`/alpha/generate`), que é outro padrão — então parte da conversa é diferente por
-natureza. Mas a compatibilidade com o Claude Code depende de um conjunto pequeno e
-específico de detalhes. Estes são os que faltam, por ordem de impacto.
+## Como a reavaliação foi feita
 
----
+Foram comparados os caminhos de request, stream, tool use, usage, erros, tokenização e
+cancelamento dos dois projetos. Além da leitura de código, o contrato do
+`POST /alpha/generate` foi medido diretamente contra a API real do commandcode:
 
-## 1. CRÍTICO — Round-trip de reasoning no request (multi-turn quebra)
+- reasoning `max` no flash chegou em 32 `reasoning-delta` pequenos, não em um bloco;
+- flash e pro aceitaram históricos com tool calls sem reasoning;
+- o commandcode emite `tool-input-start`, muitos `tool-input-delta`,
+  `tool-input-end` e só depois o `tool-call` final;
+- tools paralelas têm deltas intercalados;
+- em cache hit real, o usage foi `inputTokens=4894`,
+  `noCacheTokens=30`, `cacheReadTokens=4864`;
+- a primeira linha NDJSON chegou junto dos headers em aproximadamente 1,2 s;
+- imagens foram aceitas pelos dois modelos DeepSeek;
+- `inputTokens` cresce com o histórico e representa o prompt total.
 
-**Problema.** O `toWireMessages` do dialeto Anthropic **descarta** os blocos `thinking`
-e `redacted_thinking` do histórico:
+Essas medições corrigem premissas importantes da versão anterior deste documento.
+
+## Correções da avaliação anterior
+
+### Reasoning ausente não quebrava multi-turn no commandcode
+
+A avaliação anterior marcou como crítico injetar reasoning em todo turno de tool e
+afirmou que a conversa quebraria após a primeira chamada. Isso é verdade para o wire
+DeepSeek/OpenCode usado pelo routatic, mas não para o adaptador do commandcode.
+
+Testes reais com flash e pro, inclusive histórico com duas tool calls sem reasoning,
+foram aceitos. O commandcode monta internamente `providerOptions.reasoning_content` e
+não impõe a mesma validação do OpenCode Go.
+
+Preservar `thinking` continua sendo útil para manter a informação do modelo e
+compatibilidade de round-trip, mas não é o fator crítico que a versão anterior
+descrevia. O proxy mantém essa preservação e o placeholder como defesa compatível.
+
+### Re-chunk de reasoning raramente é necessário aqui
+
+O OpenCode Go usado pelo routatic pode entregar reasoning inteiro em um único frame.
+O commandcode medido entrega muitos deltas pequenos. Portanto, re-chunk não explica
+travamentos normais deste proxy.
+
+O fallback para deltas excepcionalmente grandes foi mantido, mas agora tem o mesmo
+budget total de pacing de 3 s do routatic. A implementação anterior não aplicou esse
+limite: um bloco muito grande poderia bloquear a leitura do upstream por vários
+segundos.
+
+### `inputTokens` não é a parcela sem cache
+
+Esta era a falha mais grave não confirmada pela avaliação anterior. A medição real
+mostrou:
+
+```text
+inputTokens      = 4894  (prompt total)
+noCacheTokens    = 30
+cacheReadTokens  = 4864
+```
+
+Publicar `input_tokens=4894` e `cache_read_input_tokens=4864` fazia o Claude Code
+contar quase todo o contexto duas vezes. O efeito é gauge de contexto inflado,
+auto-compaction precoce e telemetria incorreta.
+
+O mapeamento correto agora é:
+
+```text
+input_tokens                = inputTokenDetails.noCacheTokens
+cache_read_input_tokens     = cachedInputTokens || cacheReadTokens
+cache_creation_input_tokens = cacheWriteTokens
+```
+
+Quando `noCacheTokens` não existir, o proxy usa
+`max(0, inputTokens - cacheRead - cacheWrite)`.
+
+### O tokenizer importado não era `cl100k_base`
+
+`gpt-tokenizer` 4 exporta `o200k_base` na raiz. A implementação anterior dizia usar
+`cl100k_base`, mas importava `encode` do pacote raiz. O import agora é explicitamente:
 
 ```ts
-// anthropic.ts:150-151
-// thinking / redacted_thinking: descartados (a wire não aceita replay de reasoning)
+gpt-tokenizer/encoding/cl100k_base
 ```
 
-Isso é o exato oposto do que o routatic-proxy faz para DeepSeek. DeepSeek roda em
-thinking mode por padrão e exige que o reasoning de uma mensagem `assistant` seja
-passado de volta na próxima chamada — e que todo turno de `assistant` que chamou uma
-ferramenta traga o reasoning correspondente. Sem isso, o histórico passa a ser
-rejeitado a partir da primeira tool call (no routatic isso se manifestava como 400
-bare, e era o que matava conversa após compaction).
+Também foi acrescentado overhead de framing por mensagem, como no contador do
+routatic. Continua sendo estimativa: não existe tokenizer DeepSeek oficial exposto
+pelo commandcode.
 
-O routatic-proxy trata em três pontos:
+## Ajustes implementados nesta reavaliação
 
-1. **`EnsureThinkingBlocks`** (`internal/transformer/anthropic_wire.go:85`) — injeta um
-   bloco `{"type":"thinking","thinking":""}` (vazio, sem assinatura) em toda mensagem
-   `assistant` que tem `tool_use` mas não tem `thinking`. O upstream aceita o bloco
-   vazio.
-2. **`normalize.go:68-79`** — preserva `block.Thinking` anexado diretamente ao bloco
-   `tool_use` (o Claude Code faz isso quando o turno termina em tool call).
-3. **`normalize.go:96-102`** — `redacted_thinking` vira placeholder `" "` para que a
-   guarda de continuidade do thinking mode ainda veja o turno como "pensou".
+### 1. Streaming incremental de argumentos de tools
 
-**O wire do commandcode aceita reasoning.** O `PROTOCOLO.md` documenta o tipo
-`{type:"reasoning",text}` em conteúdo de `assistant`. Ou seja: não é que a wire não
-aceita replay — é o proxy que joga fora.
+Antes, o proxy ignorava `tool-input-start/delta/end` e esperava o `tool-call` final.
+Uma tool com argumento grande, como escrita de arquivo, só aparecia no Claude Code
+depois de toda a geração.
 
-**O que fazer no cc-proxy:**
+Agora:
 
-- No `toWireMessages` (anthropic.ts), mapear `thinking` → `{type:"reasoning", text}`
-  em vez de descartar. Idem `redacted_thinking` → `reasoning` com texto placeholder
-  (`" "`).
-- Espelhar `EnsureThinkingBlocks`: se uma mensagem `assistant` tem `tool-call` mas não
-  tem reasoning, injetar `{type:"reasoning", text:""}`.
-- Adicionar teste de round-trip **com** thinking (o teste atual em `test.mjs:352`
-  asserta o comportamento errado: `"assistant: thinking descartado"`).
+- tools declaradas pelo cliente abrem um `content_block_start` imediatamente;
+- cada `tool-input-delta` vira `input_json_delta`;
+- `tool-input-end` fecha o bloco;
+- o `tool-call` final atualiza o conteúdo acumulado sem duplicar o bloco;
+- deltas intercalados de tools paralelas são serializados em blocos Anthropic
+  sequenciais e com índices contíguos;
+- tools executadas pelo provider não são antecipadas, evitando vazar
+  `providerExecuted:true` como tool do cliente.
 
-> Ponto de atenção: validar empiricamente se o upstream commandcode (provider `cai`)
-> de fato rejeita reasoning ausente como o OpenCode Go faz. Se não rejeitar, a injeção
-> vira no-op inofensivo. Se rejeitar, é a diferença entre conversa de 1 turno e
-> conversa que sobrevive ao primeiro tool call.
+Este era o principal detalhe de streaming ausente em relação à experiência do Claude
+Code.
 
----
+### 2. Usage de cache sem dupla contagem
 
-## 2. CRÍTICO — Re-chunking do reasoning na saída
+Adicionado suporte a `inputTokenDetails.noCacheTokens` e corrigido o mapeamento
+Anthropic descrito acima. Coberto por teste com os números da medição real.
 
-**Problema.** O upstream do routatic (OpenCode Go) entrega o reasoning do DeepSeek
-**num bloco só** (um `content_block_start` preenchido, ou um único `thinking_delta`
-gigante). O Claude Code renderiza delta a delta — então um bloco que chega inteiro
-aparece inteiro, depois de uma tela congelada.
+### 3. Reasoning inline em `tool_use`
 
-O routatic resolve com `ThinkingRechunker` (`internal/transformer/thinking_rechunk.go`):
-fatiar o `thinking` em deltas de **48 runes** espaçados por **80ms**, preservando
-`index` e `signature`. O texto vai aparecendo progressivamente em vez de saltar de uma
-vez.
+O Claude Code pode anexar `thinking` diretamente ao bloco `tool_use`, em vez de criar
+um bloco `thinking` separado. O routatic já trata esse formato.
 
-**O cc-proxy não faz isso.** O handler só repassa `reasoning-delta` como chega
-(anthropic.ts:404-410). Se a wire do commandcode também bufferizar o reasoning e
-entregar num único `reasoning-delta` grande, o efeito é o mesmo congelamento.
+O cc-proxy agora converte esse campo em `reasoning` e o posiciona antes da tool. Quando
+o turno tem tool sem reasoning, o placeholder também é inserido no começo da mensagem,
+preservando a ordem `reasoning → text/tool`.
 
-**O que fazer no cc-proxy:**
+### 4. Respostas vazias bem-formadas
 
-- Medir primeiro: um request `deepseek-v4-flash` com `thinking` ligado entrega o
-  reasoning em um `reasoning-delta` só ou em vários?
-- Se vier em um bloco só, aplicar o mesmo re-chunk na saída do `appendText("thinking",
-  ...)` — fatiar em pedaços pequenos, emitir um `thinking_delta` por pedaço, com um
-  pequeno delay entre eles (mesmo budget de pacing de ~3s do routatic).
+Se todo o budget for consumido pelo reasoning suprimido, ou se só houver uma tool
+server-side, o upstream pode terminar sem conteúdo visível.
 
----
+O proxy agora garante:
 
-## 3. ALTO — `count_tokens` com tokenizer real + estimativa de imagem
+- não-stream: `content: [{type:"text", text:""}]`;
+- stream: `content_block_start` + `content_block_stop` de texto vazio antes do
+  `message_delta`.
 
-**Problema.** O cc-proxy conta por caractere:
+Sem isso, Claude Code/SDK pode interpretar o sucesso como resposta truncada.
 
-```ts
-// anthropic.ts:233
-const chars = JSON.stringify([body.system ?? "", messages, body.tools ?? []]).length;
-json(res, 200, { input_tokens: Math.max(1, Math.ceil(chars / 4)) });
+### 5. Imagens retornadas por tools
+
+Imagens dentro de `tool_result.content` eram descartadas. Agora o resultado textual
+continua como mensagem `tool` e a evidência visual é preservada numa mensagem `user`
+imediatamente posterior. Se o resultado tiver só imagem, o texto da tool recebe
+`[Image returned by tool]`.
+
+Isso importa para screenshots e ferramentas visuais usadas pelo Claude Code.
+
+### 6. Todas as grafias de effort
+
+Foi acrescentada a grafia top-level `reasoning_effort`, que a implementação anterior
+ainda havia esquecido. A precedência atual é:
+
+```text
+sufixo do model id
+  > output_config.effort
+  > reasoning_effort
+  > reasoning.effort
+  > effort
+  > level
+  > depth
+  > thinking.budget_tokens
 ```
 
-Dois defeitos:
+O commandcode aceita `low`, `medium`, `high`, `xhigh` e `max`; não é aplicado o
+colapso de níveis necessário no OpenCode Go.
 
-1. **Precisão ±25%.** O Claude Code usa `count_tokens` para decisão de budget de
-   contexto e auto-compact. Num contexto de 1M, ±25% significa compactar dezenas de
-   milhares de tokens cedo ou tarde demais.
-2. **Imagem estoura a conta.** `JSON.stringify(messages)` inclui o base64 da imagem.
-   Um screenshot de 1 MB vira ~1,3M chars ÷ 4 ≈ **333k tokens**, quando o custo real é
-   ~1.500-4.000. O Claude Code veria um "contexto" absurdamente inflado em todo request
-   com imagem e compactaria sem necessidade.
+### 7. Pacing de reasoning limitado
 
-O routatic usa **tiktoken `cl100k_base`** (`internal/token/counter.go`) e uma
-**estimativa de imagem** por tamanho do base64 (`internal/handlers/token_count.go:84-117`,
-~`rawBytes/75`, clamp 300-4000; URL sem dados → 1500 default).
+O re-chunk de frames anormalmente grandes continua em 48 runes e 80 ms, mas o sono
+total por stream foi limitado a 3 s. Depois disso, os chunks restantes são emitidos
+sem atraso.
 
-**O que fazer no cc-proxy:**
+### 8. Corrupção persistente de NDJSON deixa de ser silenciosa
 
-- Trocar char/4 por um tokenizer real. Em Node, `gpt-tokenizer` (ou `js-tiktoken`) com
-  `cl100k_base` é a dependência certa (o `@anthropic-ai/sdk` já usa por baixo dos
-  panos; dá pra reutilizar a contagem dele em vez de adicionar lib). Para DeepSeek o
-  `cl100k` é aproximado, mas ordens de grandeza melhor que char/4.
-- Contar imagens separadamente com a heurística do routatic (nunca `/4` sobre o
-  base64).
+O parser descartava qualquer linha inválida sem aviso, podendo transformar stream
+corrompido em resposta parcial de sucesso. Agora tolera até três falhas consecutivas e
+depois encerra com erro; uma última linha inválida também falha explicitamente.
 
----
+### 9. Exceções assíncronas não derrubam o processo
 
-## 4. ALTO — Keepalive `event: ping` no stream
+O callback HTTP assíncrono não tinha barreira para promises rejeitadas. Uma exceção
+fora dos catches locais podia virar rejection não tratada e encerrar o Node.
 
-**Problema.** O routatic emite `event: ping\ndata: {"type":"ping"}` a cada **3s**
-enquanto o stream está vivo (`internal/handlers/messages.go:266-341`), o mesmo
-heartbeat que a Messages API real manda. Serve para atravessar proxies/timeouts de
-camada de rede e manter o stream aberto durante pausas longas de reasoning.
+O servidor agora captura a falha no topo, devolve erro no dialeto correto quando os
+headers ainda não foram enviados e destrói somente a conexão quando o stream já
+começou.
 
-O cc-proxy não emite nenhum ping. Num reasoning longo do DeepSeek (que pode ficar
-muitos segundos sem emitir texto), a conexão pode ser morta por idle de algum
-intermediário ou do próprio harness.
+## Pontos da implementação anterior confirmados e mantidos
 
-**O que fazer no cc-proxy:**
+- keepalive Anthropic `event: ping` em cadência fixa de 3 s;
+- idle watchdog renovado por chunks do upstream;
+- cancelamento upstream quando o cliente desconecta;
+- headers SSE só são confirmados depois de o upstream responder com HTTP 2xx;
+- `overloaded_error` para 503/529;
+- `rate_limit_error` e `Retry-After: 30` para 429 antes do stream;
+- erro no meio do stream termina sem `message_stop`;
+- `message_start` com usage zerado e usage autoritativo no `message_delta`;
+- preservação de `thinking` e `redacted_thinking`;
+- `count_tokens` com base64 de imagem contado separadamente;
+- stop sequences aplicadas no proxy;
+- índices de content blocks contíguos;
+- tool call final com `input` objeto;
+- filtro de tools `providerExecuted`.
 
-- No caminho stream (anthropic.ts), após `sseHead`, disparar um `setInterval` de ~3s
-  que escreve `event: ping\ndata: {"type":"ping"}\n\n` **apenas se não houve escrita
-  desde o último tick** (não intercalar ping no meio de um frame). Limpar o interval
-  no `message_stop`/`error`/`close`.
+## Limitações residuais do wire commandcode
 
----
+Estas limitações não têm correção fiel apenas no proxy:
 
-## 5. MÉDIO — Mapeamento de erro completo (`overloaded_error`, `Retry-After`)
+| Item | Estado |
+|---|---|
+| assinatura de thinking | commandcode não fornece assinatura replayable; resposta usa `signature:""` |
+| `tool_choice any/tool` | wire não expõe controle equivalente; vira instrução no system |
+| `count_tokens` | estimativa `cl100k_base` + overhead + heurística de imagem, não billing exato |
+| prompt caching Anthropic | `cache_control` não é repassado; usage reflete o cache próprio do commandcode |
+| PDF/document | continua rejeitado com 400; `/alpha/generate` não oferece tradução fiel |
+| APIs Anthropic auxiliares | batches, files e managed agents permanecem fora de escopo |
+| tools server-side | argumentos não são antecipados porque `providerExecuted` só chega no evento final |
 
-**Problema.** O `ERROR_MAP` do dialeto Anthropic (anthropic.ts:58-65) não tem
-`overloaded` e o `classifyUpstreamError` (upstream.ts:204-215) trata qualquer status
-≥500 como `upstream` → `api_error`. O routatic mapeia:
+## Verificação
 
-```
-529/503 → overloaded_error
-429     → rate_limit_error  (+ header Retry-After: 30)
-```
+A suíte mock cobre, entre outros:
 
-(`internal/transformer/response.go:154-173`, e `Retry-After` em
-`internal/handlers/messages.go:400-405` e `1045-1048`.)
+- tool input incremental e tools paralelas intercaladas;
+- cache sem dupla contagem;
+- resposta vazia stream e não-stream;
+- reasoning dedicado, inline e redacted;
+- round-trip de tool;
+- imagem em tool result;
+- keepalive, idle timeout e cancelamento;
+- erros HTTP e mid-stream;
+- SDK oficial Anthropic montando `finalMessage()`;
+- tokenizer e estimativa de imagem.
 
-O Claude Code tem política de retry/backoff distinta por tipo de erro: `overloaded_error`
-(529) e `rate_limit_error` (429) disparam backoff e re-tentativa; `api_error` genérico
-não. Sem `overloaded_error`, um 503 do upstream vira falha dura onde deveria re-tentar.
+Após os ajustes: `npm run typecheck` e `npm run test:mock` passam integralmente
+(175/175). A validação paga contra a API real também passou em todos os caminhos
+Anthropic exercitados: stream, não-stream, tool round-trip, stop sequence, effort e SDK.
 
-**O que fazer no cc-proxy:**
+## Conclusão
 
-- Adicionar `overloaded` ao `ErrorKind` e mapear 529/503 → `overloaded_error` no
-  `ERROR_MAP` do Anthropic.
-- Em 429, mandar header `Retry-After: 30` (tanto no path HTTP quanto no evento `error`
-  do stream).
+O proxy já tinha boa compatibilidade geral, mas a avaliação anterior priorizou dois
+problemas herdados do wire do routatic que não se reproduzem da mesma forma no
+commandcode. Os problemas efetivos mais relevantes eram:
 
----
+1. dupla contagem de tokens cacheados;
+2. perda do streaming incremental dos argumentos de tools;
+3. respostas vazias fora do contrato;
+4. reasoning inline e imagens de tool result descartados;
+5. tokenizer diferente do documentado e pacing sem limite.
 
-## 6. MÉDIO — Campos de effort que o Claude Code pode mandar
-
-**Problema.** O cc-proxy lê só `output_config.effort` e `thinking.budget_tokens`
-(anthropic.ts:263-271). O routatic lê todas as grafias que o Claude Code e outros
-clientes já usaram (`internal/core/normalize.go:147-188`):
-
-```
-output_config.effort  →  reasoning_effort  →  reasoning.effort  →  effort  →  level  →  depth
-```
-
-O `output_config.effort` (Claude Code 2.x) é o principal e **já está coberto**. Mas
-`reasoning.effort`, `level` e `depth` são grafias que aparecem em builds/harnesses
-diferentes e hoje são silenciosamente ignoradas (o request cai no effort default).
-
-**O que fazer no cc-proxy:**
-
-- Estender `cfgEffort` para tentar, em ordem: `output_config.effort` →
-  `reasoning.effort` → `effort` → `level` → `depth` (mapear depth 1→low, 2→medium,
-  3→high, ≥4→max) → `thinking.budget_tokens` por faixa.
-
-> Nota: a normalização `low|medium|high|xhigh|max` do routatic **colapsa** para
-> `low|high|max` (`normalizeDeepSeekEffort`, `request.go:311`) porque o OpenCode Go só
-> entende 3 níveis. A wire do commandcode aceita os 5 — o cc-proxy está certo em
-> repassar direto. Não copiar o colapso; copiar só a leitura das grafias.
-
----
-
-## 7. MÉDIO — Idle watchdog por byte (não só timeout global)
-
-**Problema.** O cc-proxy tem um único `AbortSignal.timeout(10min)`
-(upstream.ts:18) + abort em `res.on("close")`. Não detecta stream **pendurado** — uma
-conexão que parou de emitir mas não fechou só é derrubada aos 10 min.
-
-O routatic usa idle watchdog **por leitura**: cada byte que chega renova um deadline;
-se nenhum byte chegar por `idle_timeout`, cancela o upstream e (no caso do routatic,
-que tem fallback) tenta o próximo modelo. Para o cc-proxy não há fallback, mas a
-detecção de travamento ainda evita pendurar a request do Claude Code por 10 min.
-
-**O que fazer no cc-proxy:**
-
-- No loop de `readEvents`, rastrear o timestamp da última linha emitida e abortar o
-  `AbortController` se o gap passar de um idle timeout configurável (ex. 60s). É um
-  `setInterval`/comparação simples, sem reescrever o parser.
-
----
-
-## 8. VERIFICAR — `input_tokens` e cache no `message_delta`
-
-**Ponto de atenção, não bug confirmado.** O routatic subtrai cache do prompt:
-
-```
-input_tokens = prompt_tokens - cache_read - cache_write
-```
-
-(`internal/transformer/response.go:58-72` e `stream.go:836-855`.) O motivo: na
-Messages API, `input_tokens` é o total de tokens **não-cache** do turno; se o proxy
-reportar o prompt total, o gauge de contexto do Claude Code vê um input inflado a cada
-turno e dispara auto-compact ~5x cedo demais.
-
-O cc-proxy mapeia `input_tokens = u.inputTokens ?? 0` direto da wire. O `PROTOCOLO.md`
-sugere que o `inputTokens` do commandcode **já é** o não-cache (exemplo medido: 97
-tokens para prompt de 5 palavras, com o prompt de agente injetado vindo do cache em
-`cacheReadTokens`). Se isso se confirmar, o mapeamento atual está correto.
-
-**O que fazer no cc-proxy:**
-
-- Conferir num request real multi-turn: o `inputTokens` do `finish` cresce junto com o
-  tamanho total do histórico (sinal de que inclui cache → precisa subtrair) ou fica
-  pequeno e estável (já é não-cache → ok)?
-- Se incluir cache, aplicar a mesma subtração do routatic no `usageOf`.
-
-> O `message_start` do cc-proxy **já** sai com usage zerado e o valor real no
-> `message_delta` — isso é o comportamento correto (o mesmo que o routatic aprendeu a
-> fazer em `stream.go:197-209`). Manter.
-
----
-
-## 9. MENOR — `display_name` no `GET /v1/models`
-
-O routatic documenta que o Claude Code, ao descobrir modelos via gateway
-(`GET /v1/models?limit=1000`), lê `display_name` mas **só exibe ids começando com
-`claude`/`anthropic`** (`internal/handlers/models.go:25-31`).
-
-O cc-proxy já devolve `display_name` (anthropic.ts:81). Sem impacto prático para
-DeepSeek, já que o Claude Code usa o model string configurado e não o picker. Deixar
-como está; só não remover o campo.
-
----
-
-## Resumo de prioridade
-
-| # | Item | Impacto | Arquivo(s) no cc-proxy |
-|---|------|---------|------------------------|
-| 1 | Preservar/injetar reasoning no request | quebra multi-turn | `anthropic.ts` (toWireMessages) |
-| 2 | Re-chunk do reasoning na saída | tela congelada | `anthropic.ts` (handleStream) |
-| 3 | count_tokens real + imagem | auto-compact errado | `anthropic.ts:225` |
-| 4 | Keepalive ping 3s | stream cai em reasoning longo | `anthropic.ts` (stream) |
-| 5 | overloaded_error 529 + Retry-After | retry não acontece | `anthropic.ts`, `upstream.ts` |
-| 6 | Grafias extras de effort (level/depth/…) | effort default errado | `anthropic.ts:263` |
-| 7 | Idle watchdog por byte | request pendura 10min | `anthropic.ts` (stream) |
-| 8 | input_tokens vs cache | auto-compact (verificar) | `anthropic.ts` (usageOf) |
-| 9 | display_name | nenhum (manter) | — |
-
-Os itens 1 e 2 são os que explicam a sensação de "funciona mas não está 100%":
-multi-turn com tool que morre depois do primeiro call, e reasoning que aparece de uma
-vez. Comece por eles.
+Esses pontos foram corrigidos. O que permanece é limitação explícita do
+`/alpha/generate`, não incompatibilidade acidental do adaptador.

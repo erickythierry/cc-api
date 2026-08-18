@@ -164,8 +164,9 @@ com `tool_result` (que vira `role:"tool"` na wire do commandcode).
 | `max_tokens`, `temperature`, `top_p` | ✅ |
 | `stop_sequences` | ✅ cortado no proxy — a wire não tem; ao cortar, aborta o upstream |
 | `stream` (SSE completo, índices sequenciais, `input_json_delta`) | ✅ |
-| `thinking` (`adaptive`/`enabled`) | ⚠️ blocos `thinking` com `signature: ""` (ver limitações) |
-| `output_config.effort` / `thinking.budget_tokens` / sufixo de effort no id | ✅ (precedência: sufixo > `output_config.effort` > `budget_tokens`) |
+| `thinking` (`adaptive`/`enabled`) | ⚠️ blocos `thinking` com `signature: ""`; round-trip preserva reasoning |
+| reasoning inline em `tool_use` | ✅ convertido para reasoning antes da tool |
+| `output_config.effort` / `reasoning_effort` / grafias alternativas / `thinking.budget_tokens` / sufixo | ✅ |
 | `stop_reason` `end_turn`/`tool_use`/`max_tokens`/`stop_sequence` + `stop_sequence` | ✅ |
 | `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) | ✅ |
 | erros: HTTP + `error.type` Anthropic (`rate_limit_error`, `authentication_error`, `not_found_error`, `api_error`) | ✅ |
@@ -182,10 +183,10 @@ com `tool_result` (que vira `role:"tool"` na wire do commandcode).
 | Item | Comportamento |
 |---|---|
 | prompt caching (`cache_control`) | aceito e ignorado; os campos de cache no `usage` refletem o cache do **upstream** |
-| blocos `thinking` no request | descartados (a wire não aceita replay de reasoning) |
+| blocos `thinking` no request | preservados como `reasoning`; `redacted_thinking` usa placeholder |
 | `signature` dos blocos `thinking` na resposta | string vazia — serve para leitura, não para replay |
 | `usage.input_tokens` no stream | vem no `message_delta` (a wire só entrega usage no fim); `finalMessage().usage` do SDK sai correto |
-| `count_tokens` | estimativa por caracteres (`chars/4`) — a wire não expõe tokenizer |
+| `count_tokens` | estimativa `cl100k_base` + overhead e heurística de imagem — a wire não expõe tokenizer DeepSeek |
 | `anthropic-version` | aceito com qualquer valor, inclusive ausente |
 | auth | o proxy **não valida** `x-api-key` (igual ao lado OpenAI); a key real é a do commandcode |
 
@@ -199,7 +200,7 @@ npm run test:openai     # só o dialeto OpenAI
 npm run typecheck       # tsc --noEmit (só checa tipos, não emite nada)
 ```
 
-Estado atual: **189 ok, 0 falhou** (142 no modo `--mock`).
+Estado atual da suíte sem custo: **175 ok, 0 falhou** no modo `--mock`.
 
 A parte de conformidade sobe um upstream falso e cobre os caminhos que não dá pra provocar de
 propósito na API real: erro no meio do stream, HTTP 429/401/403 do upstream, NDJSON sem newline
@@ -229,6 +230,7 @@ test.mjs        # suite única (mock + SDKs + reais), com seções por dialeto
 | `COMMAND_CODE_API_KEY` | lê `~/.commandcode/auth.json` | key do commandcode |
 | `COMMANDCODE_API_URL` | `https://api.commandcode.ai` | upstream |
 | `CC_DEFAULT_SYSTEM` | `You are a helpful assistant.` | system usado quando o request não traz nenhum |
+| `CC_IDLE_TIMEOUT_MS` | `60000` | gap máximo sem bytes no stream upstream |
 
 ### Por que existe um system default
 
@@ -268,11 +270,12 @@ reasoning (medido no flash: `reasoning_tokens` low < high < max, apesar de o bun
 listar `high|max`). Modelo **sem** reasoning (`efforts: []`, ex. Kimi/MiniMax) descarta o
 esforço em vez de mandar um `reasoning_effort` que a wire ignora.
 
-Alternativa: mandar o esforço no body — `"reasoning_effort"` (OpenAI), `output_config.effort`
-(Anthropic; é onde o `claude --effort` do Claude Code cai) ou `thinking.budget_tokens`
-(Anthropic, mapeado por faixa: ≤2048 `low`, ≤8192 `medium`, ≤32768 `high`, acima `max`).
-Precedência: sufixo no id > `output_config.effort` > `budget_tokens`. Valor inválido é
-descartado, não vira erro.
+Alternativa: mandar o esforço no body — `"reasoning_effort"` (OpenAI ou Anthropic),
+`output_config.effort` (onde o `claude --effort` do Claude Code cai), `reasoning.effort`,
+`effort`, `level`, `depth` ou `thinking.budget_tokens` (mapeado por faixa: ≤2048 `low`,
+≤8192 `medium`, ≤32768 `high`, acima `max`). Precedência: sufixo no id >
+`output_config.effort` > `reasoning_effort` > demais grafias > `budget_tokens`. Valor
+inválido é descartado, não vira erro.
 
 No opencode: os modelos-variante aparecem como `commandcode/deepseek/deepseek-v4-flash-max`
 em `/models`.

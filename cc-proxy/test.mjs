@@ -65,6 +65,39 @@ const SCENARIOS = {
     { type: "tool-call", toolName: "get_weather", toolCallId: "tc_9", input: { city: "Paris" } },
     { type: "finish", finishReason: "tool_calls", totalUsage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } },
   ],
+  "incremental-tool": [
+    { type: "tool-input-start", id: "tc_inc", toolName: "get_weather", dynamic: false },
+    { type: "tool-input-delta", id: "tc_inc", delta: "{\"city\":" },
+    { type: "tool-input-delta", id: "tc_inc", delta: "\"Paris\"}" },
+    { type: "tool-input-end", id: "tc_inc" },
+    { type: "tool-call", toolName: "get_weather", toolCallId: "tc_inc", input: { city: "Paris" } },
+    { type: "finish", finishReason: "tool_calls", totalUsage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } },
+  ],
+  "parallel-tools": [
+    { type: "tool-input-start", id: "tc_p1", toolName: "get_weather", dynamic: false },
+    { type: "tool-input-delta", id: "tc_p1", delta: "{\"city\":\"Pa" },
+    { type: "tool-input-start", id: "tc_p2", toolName: "get_weather", dynamic: false },
+    { type: "tool-input-delta", id: "tc_p2", delta: "{\"city\":\"Ly" },
+    { type: "tool-input-delta", id: "tc_p1", delta: "ris\"}" },
+    { type: "tool-input-end", id: "tc_p1" },
+    { type: "tool-call", toolName: "get_weather", toolCallId: "tc_p1", input: { city: "Paris" } },
+    { type: "tool-input-delta", id: "tc_p2", delta: "on\"}" },
+    { type: "tool-input-end", id: "tc_p2" },
+    { type: "tool-call", toolName: "get_weather", toolCallId: "tc_p2", input: { city: "Lyon" } },
+    { type: "finish", finishReason: "tool_calls", totalUsage: { inputTokens: 3, outputTokens: 6, totalTokens: 9 } },
+  ],
+  "empty": [
+    { type: "finish", finishReason: "max_tokens", totalUsage: { inputTokens: 3, outputTokens: 64, totalTokens: 67 } },
+  ],
+  "cached-usage": [
+    { type: "text-delta", text: "ok" },
+    { type: "finish", finishReason: "stop", totalUsage: {
+      inputTokens: 4894,
+      inputTokenDetails: { noCacheTokens: 30, cacheReadTokens: 4864 },
+      outputTokens: 2,
+      totalTokens: 4896,
+    } },
+  ],
   // reasoning entregue num delta só (grande): o proxy precisa re-chunkar na saída
   "long-reasoning": [
     { type: "reasoning-delta", text: "x".repeat(200) },
@@ -386,6 +419,16 @@ async function anthropicConformance() {
   {
     await postA(MOCK_BASE, MSG({ messages: [
       { role: "user", content: "clima?" },
+      { role: "assistant", content: [{ type: "tool_use", id: "tu_inline", name: "get_weather", input: {}, thinking: "vou consultar" }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_inline", content: "18C" }] },
+    ] }));
+    const asst = (lastUpstreamBody?.params?.messages ?? []).find((x) => x.role === "assistant");
+    check("thinking inline no tool_use → reasoning antes da tool", asst?.content?.[0]?.type === "reasoning"
+      && asst.content[0].text === "vou consultar" && asst.content[1]?.type === "tool-call", JSON.stringify(asst?.content));
+  }
+  {
+    await postA(MOCK_BASE, MSG({ messages: [
+      { role: "user", content: "clima?" },
       { role: "assistant", content: [{ type: "redacted_thinking", data: "abc" }, { type: "tool_use", id: "tu_1", name: "get_weather", input: {} }] },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: "18C" }] },
     ] }));
@@ -398,6 +441,19 @@ async function anthropicConformance() {
     const tr = lastUpstreamBody?.params?.messages?.[0]?.content?.[0];
     check("tool_result is_error → value prefixado com 'Error: '", tr?.output?.value === "Error: boom", JSON.stringify(tr));
     check("  tool_use_id sem match → toolName unknown", tr?.toolName === "unknown");
+  }
+  {
+    await postA(MOCK_BASE, MSG({ messages: [
+      { role: "user", content: "veja" },
+      { role: "assistant", content: [{ type: "tool_use", id: "img_1", name: "screenshot", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "img_1", content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+      ] }] },
+    ] }));
+    const wm = lastUpstreamBody?.params?.messages ?? [];
+    check("imagem dentro de tool_result é preservada", wm.some((x) =>
+      x.role === "user" && x.content?.some((p) => p.type === "image" && p.image === "data:image/png;base64,AAAA")),
+    JSON.stringify(wm));
   }
   {
     await postA(MOCK_BASE, MSG({ messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } }, { type: "text", text: "o que é?" }] }] }));
@@ -429,6 +485,7 @@ async function anthropicConformance() {
     check("modelo sem reasoning descarta o effort", !("reasoning_effort" in (lastUpstreamBody?.params ?? {})), `effort=${lastUpstreamBody?.params?.reasoning_effort}`);
     // grafias alternativas de effort (razing.effort / effort / level / depth)
     for (const [extra, want] of [
+      [{ reasoning_effort: "max" }, "max"],
       [{ reasoning: { effort: "medium" } }, "medium"],
       [{ effort: "high" }, "high"],
       [{ level: "low" }, "low"],
@@ -474,6 +531,17 @@ async function anthropicConformance() {
     check("finishReason max_tokens → stop_reason max_tokens", d3?.stop_reason === "max_tokens", `sr=${d3?.stop_reason}`);
   }
   {
+    const { data } = await postA(MOCK_BASE, MSG({ model: "cached-usage" }));
+    check("usage cacheado: input_tokens contém só no-cache", data?.usage?.input_tokens === 30, JSON.stringify(data?.usage));
+    check("  cache_read_input_tokens preservado sem dupla contagem", data?.usage?.cache_read_input_tokens === 4864, JSON.stringify(data?.usage));
+  }
+  {
+    const { data } = await postA(MOCK_BASE, MSG({ model: "empty" }));
+    check("resposta vazia ganha bloco text vazio", data?.content?.length === 1
+      && data.content[0]?.type === "text" && data.content[0].text === "", JSON.stringify(data?.content));
+    check("  preserva stop_reason max_tokens", data?.stop_reason === "max_tokens", `sr=${data?.stop_reason}`);
+  }
+  {
     const { data: sem } = await postA(MOCK_BASE, MSG({ model: "reasoning" }));
     check("reasoning sem thinking no request → sem bloco thinking", !sem?.content?.some((b) => b.type === "thinking"), JSON.stringify(sem?.content));
     const { data: com } = await postA(MOCK_BASE, MSG({ model: "reasoning", thinking: { type: "adaptive" } }));
@@ -516,6 +584,32 @@ async function anthropicConformance() {
     check("  delta input_json_delta parseável", tuDelta?.data?.delta?.type === "input_json_delta" && JSON.parse(tuDelta.data.delta.partial_json).city === "Paris");
     const md = events.find((e) => e.event === "message_delta");
     check("  stop_reason tool_use", md?.data?.delta?.stop_reason === "tool_use", JSON.stringify(md?.data?.delta));
+  }
+  {
+    const tool = { name: "get_weather", description: "clima", input_schema: { type: "object", properties: { city: { type: "string" } } } };
+    const { events } = await streamA(MOCK_BASE, MSG({ model: "incremental-tool", tools: [tool] }));
+    const starts = events.filter((e) => e.event === "content_block_start" && e.data?.content_block?.type === "tool_use");
+    const deltas = events.filter((e) => e.data?.delta?.type === "input_json_delta");
+    check("tool input incremental: um único bloco tool_use", starts.length === 1 && starts[0].data.content_block.id === "tc_inc", JSON.stringify(starts));
+    check("  argumentos fluem em múltiplos deltas", deltas.length === 2
+      && deltas.map((e) => e.data.delta.partial_json).join("") === "{\"city\":\"Paris\"}", JSON.stringify(deltas));
+    check("  evento final tool-call não duplica bloco", starts.length === 1);
+  }
+  {
+    const tool = { name: "get_weather", description: "clima", input_schema: { type: "object", properties: { city: { type: "string" } } } };
+    const { events } = await streamA(MOCK_BASE, MSG({ model: "parallel-tools", tools: [tool] }));
+    const seq = events.filter((e) => ["content_block_start", "content_block_stop"].includes(e.event))
+      .map((e) => `${e.event === "content_block_start" ? "S" : "E"}${e.data.index}`).join(" ");
+    const starts = events.filter((e) => e.event === "content_block_start");
+    check("tools paralelas intercaladas viram blocos Anthropic sequenciais", seq === "S0 E0 S1 E1", seq);
+    check("  dois ids preservados sem duplicação", starts.map((e) => e.data.content_block.id).join(",") === "tc_p1,tc_p2",
+      starts.map((e) => e.data.content_block.id).join(","));
+  }
+  {
+    const { events } = await streamA(MOCK_BASE, MSG({ model: "empty" }));
+    const starts = events.filter((e) => e.event === "content_block_start");
+    check("stream vazio ganha bloco text vazio", starts.length === 1
+      && starts[0].data?.content_block?.type === "text" && events.at(-1)?.event === "message_stop", events.map((e) => e.event).join(","));
   }
   {
     const { events } = await streamA(MOCK_BASE, MSG({ model: "reasoning", thinking: { type: "adaptive" } }));

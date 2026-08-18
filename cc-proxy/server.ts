@@ -31,7 +31,7 @@ function pickDialect(req: IncomingMessage, path: string): Dialect {
   return "openai";
 }
 
-const server = createServer(async (req, res) => {
+async function handleRequest(req: IncomingMessage, res: import("node:http").ServerResponse): Promise<void> {
   const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
   let path = url.pathname;
   const sessionId = randomUUID();
@@ -66,6 +66,28 @@ const server = createServer(async (req, res) => {
 
   if (dialect === "anthropic") anthropic.anthropicError(res, 404, `Endpoint não encontrado: ${req.method} ${path}`, "not_found_error");
   else openai.openAiError(res, 404, `Endpoint não encontrado: ${req.method} ${path}`, "invalid_request_error", "unknown_url");
+}
+
+const server = createServer((req, res) => {
+  void handleRequest(req, res).catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[cc-proxy] erro não tratado: ${message}`);
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    const path = new URL(req.url ?? "/", `http://${req.headers.host}`).pathname;
+    const dialect = path === "/anthropic" || path.startsWith("/anthropic/")
+      ? "anthropic"
+      : path === "/openai" || path.startsWith("/openai/")
+        ? "openai"
+        : pickDialect(req, path);
+    if (dialect === "anthropic") {
+      anthropic.anthropicError(res, 500, "Erro interno do proxy.", "api_error");
+    } else {
+      openai.openAiError(res, 500, "Erro interno do proxy.", "server_error");
+    }
+  });
 });
 
 server.listen(PORT, HOST, () => {

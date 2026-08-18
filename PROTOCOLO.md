@@ -126,6 +126,9 @@ nada. Quem usa a wire fora do TUI deve sempre mandar `system`.
 | `start-step` | início de step |
 | `text-start` / `text-delta` / `text-end` | `text` (delta) |
 | `reasoning-start` / `reasoning-delta` / `reasoning-end` | `text` (delta) |
+| `tool-input-start` | `id`, `toolName`, `dynamic` — início dos argumentos de uma tool |
+| `tool-input-delta` | `id`, `delta` — fragmento incremental do JSON de argumentos |
+| `tool-input-end` | `id` — fim dos argumentos; tools paralelas podem intercalar deltas |
 | `tool-call` | `toolName`, `toolCallId`, `input` (ou `args`), `providerExecuted` |
 | `tool-result` | `toolCallId`, `toolName`, `output` (tool executada pelo server) |
 | `finish-step` | fim de step |
@@ -138,8 +141,13 @@ Testado real (plano Go, deepseek-v4-flash): reasoning → texto → `finish` com
 `{inputTokens:97, outputTokens:78 (text 8 + reasoning 70), totalTokens:175}`.
 
 `finishReason` normalizado: `tool_calls`→`tool_calls`, `length`→`max_tokens`, senão `end_turn`.
-`totalUsage` traz também `inputTokenDetails.cacheReadTokens` / `cachedInputTokens` e
-`outputTokenDetails.reasoningTokens` — o prompt de agente injetado vem quase todo do cache.
+`totalUsage.inputTokens` é o tamanho **total** do prompt, incluindo cache. O detalhamento
+traz `inputTokenDetails.noCacheTokens`, `inputTokenDetails.cacheReadTokens` /
+`cachedInputTokens` e, quando aplicável, `cacheWriteTokens`. Medição real repetindo um
+prompt grande: `inputTokens=4894`, `noCacheTokens=30`, `cacheReadTokens=4864`. Ao
+traduzir para Anthropic, use `noCacheTokens` como `input_tokens`, não `inputTokens`, para
+não contar a parcela cacheada duas vezes. `outputTokenDetails.reasoningTokens` separa o
+raciocínio da saída textual.
 O stream fecha com `\n`, mas o parser não deve depender disso: a última linha carrega o `finish`
 (usage inteira).
 

@@ -3,7 +3,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { encode } from "gpt-tokenizer";
+import { encode } from "gpt-tokenizer/encoding/cl100k_base";
 
 import { EFFORT_LEVELS, MODELS, resolveModel, type Model } from "./models.ts";
 import {
@@ -48,6 +48,7 @@ interface MessagesBody {
   tool_choice?: { type?: string; name?: string };
   thinking?: { type?: string; budget_tokens?: number };
   output_config?: { effort?: string };
+  reasoning_effort?: string;
   reasoning?: { effort?: string };
   effort?: string;
   level?: string;
@@ -90,6 +91,7 @@ function setRetryAfter(res: ServerResponse, status: number): void {
 const PING_MS = 3000;
 const THINK_CHUNK = 48; // runes por thinking_delta (mesmo budget do routatic)
 const THINK_DELAY = 80; // ms entre deltas
+const THINK_PACING_BUDGET = 3000; // pacing total máximo por stream
 
 function chunkRunes(s: string, n: number): string[] {
   const runes = Array.from(s);
@@ -162,24 +164,27 @@ async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage
 
     if (msg.role === "assistant") {
       const parts: WirePart[] = [];
-      let hasReasoning = false;
+      // O Claude Code também pode anexar `thinking` diretamente ao tool_use. Detectar
+      // antes do loop permite pôr o placeholder no começo do turno, como exige a ordem
+      // Anthropic (thinking → text/tool), em vez de inseri-lo depois de um bloco text.
+      const hasToolUse = blocks.some((b) => b?.type === "tool_use");
+      const hasDedicatedReasoning = blocks.some((b) =>
+        b?.type === "thinking" || b?.type === "redacted_thinking");
+      const inlineReasoning = blocks.find((b) =>
+        b?.type === "tool_use" && typeof b.thinking === "string" && b.thinking.length > 0)?.thinking;
+      if (hasToolUse && !hasDedicatedReasoning) {
+        parts.push({ type: "reasoning", text: inlineReasoning ?? " " });
+      }
       for (const b of blocks) {
         if (!b) continue;
         if (b.type === "text" && b.text) parts.push({ type: "text", text: b.text });
         else if (b.type === "thinking" && typeof b.thinking === "string") {
-          // round-trip de reasoning: DeepSeek exige o thinking do turno anterior na próxima chamada
+          // Preserva a trilha de reasoning no round-trip (o commandcode aceita replay).
           parts.push({ type: "reasoning", text: b.thinking });
-          hasReasoning = true;
         } else if (b.type === "redacted_thinking") {
           // sem conteúdo (censurado); o placeholder marca o turno como "pensou"
           parts.push({ type: "reasoning", text: " " });
-          hasReasoning = true;
         } else if (b.type === "tool_use") {
-          // EnsureThinkingBlocks: tool turn sem reasoning é rejeitado pelo upstream em thinking mode
-          if (!hasReasoning) {
-            parts.push({ type: "reasoning", text: " " });
-            hasReasoning = true;
-          }
           parts.push({
             type: "tool-call",
             toolCallId: b.id ?? toolUseId(),
@@ -199,7 +204,9 @@ async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage
     for (const b of blocks) {
       if (!b) continue;
       if (b.type === "tool_result") {
-        const value = toolResultText(b.content);
+        const inner = Array.isArray(b.content) ? b.content as AnthropicBlock[] : [];
+        const hasImage = inner.some((part) => part?.type === "image");
+        const value = toolResultText(b.content) || (hasImage ? "[Image returned by tool]" : "");
         toolResults.push({
           type: "tool-result",
           toolCallId: b.tool_use_id ?? "",
@@ -207,6 +214,11 @@ async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage
           // a wire não tem flag de erro no tool-result
           output: { type: "text", value: b.is_error === true ? `Error: ${value}` : value },
         });
+        // A wire não aceita imagem dentro de output:text. Preserve a evidência visual
+        // como uma mensagem user imediatamente depois dos tool results.
+        for (const part of inner) {
+          if (part?.type === "image") rest.push({ type: "image", ...(await imageBlockToWire(part)) });
+        }
       } else if (b.type === "text") {
         if (b.text) rest.push({ type: "text", text: b.text });
       } else if (b.type === "image") {
@@ -223,14 +235,18 @@ async function toWireMessages(messages: AnthropicMessage[]): Promise<WireMessage
 
 function usageOf(u: WireUsage | null) {
   if (!u) return { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-  // `inputTokens` da wire JÁ é o não-cache (medido: 97 tok num prompt de 5 palavras com o
-  // prompt de agente em cacheReadTokens; real multi-turn confirmou ~426 num turno pequeno).
-  // Subtrair cache aqui inflaria o gauge de contexto do Claude Code e dispararia auto-compact.
+  const cacheRead = Math.max(u.cachedInputTokens ?? 0, u.inputTokenDetails?.cacheReadTokens ?? 0);
+  const cacheWrite = u.inputTokenDetails?.cacheWriteTokens ?? 0;
+  // Medição real confirmou que inputTokens é o prompt TOTAL. Em cache hit: inputTokens=4894,
+  // noCacheTokens=30 e cacheReadTokens=4864. Anthropic espera em input_tokens somente a
+  // parcela regular; publicar o total junto do cache_read conta o contexto duas vezes.
+  const regularInput = u.inputTokenDetails?.noCacheTokens
+    ?? Math.max(0, (u.inputTokens ?? 0) - cacheRead - cacheWrite);
   return {
-    input_tokens: u.inputTokens ?? 0,
+    input_tokens: regularInput,
     output_tokens: u.outputTokens ?? 0,
-    cache_creation_input_tokens: u.inputTokenDetails?.cacheWriteTokens ?? 0,
-    cache_read_input_tokens: u.cachedInputTokens ?? u.inputTokenDetails?.cacheReadTokens ?? 0,
+    cache_creation_input_tokens: cacheWrite,
+    cache_read_input_tokens: cacheRead,
   };
 }
 
@@ -247,9 +263,8 @@ function budgetTokensToEffort(budget: number | undefined): string | null {
 }
 
 // ---------- count_tokens: tokenizer cl100k real + estimativa de imagem ----------
-// cl100k_base (gpt-tokenizer, o mesmo que o @anthropic-ai/sdk usa por baixo). Para DeepSeek
-// é aproximado, mas ordens de grandeza melhor que char/4 — e o base64 de imagem nunca é
-// tokenizado (estouraria a conta em ~350k por screenshot).
+// cl100k_base explícito. O export principal de gpt-tokenizer 4 usa o200k_base, então importar
+// da raiz não reproduz a heurística da referência. Para DeepSeek ainda é uma aproximação.
 const textTokens = (s: string) => (s ? encode(s).length : 0);
 
 // heurística do routatic: ~rawBytes/75, clamp 300-4000; URL sem dados → 1500 default
@@ -277,14 +292,14 @@ function countContentTokens(blocks: AnthropicBlock[]): number {
 }
 
 function countTokensBody(body: MessagesBody): number {
-  let n = 0;
-  if (typeof body.system === "string") n += textTokens(body.system);
-  else if (Array.isArray(body.system)) n += countContentTokens(body.system as AnthropicBlock[]);
+  let n = 3; // framing inicial
+  if (typeof body.system === "string") n += textTokens(body.system) + 5;
+  else if (Array.isArray(body.system)) n += countContentTokens(body.system as AnthropicBlock[]) + 5;
   for (const msg of body.messages ?? []) {
     if (!msg) continue;
     const c = msg.content;
-    if (typeof c === "string") n += textTokens(c);
-    else if (Array.isArray(c)) n += countContentTokens(c as AnthropicBlock[]);
+    if (typeof c === "string") n += textTokens(c) + 5;
+    else if (Array.isArray(c)) n += countContentTokens(c as AnthropicBlock[]) + 5;
   }
   if (Array.isArray(body.tools)) n += textTokens(JSON.stringify(body.tools));
   return n;
@@ -345,10 +360,10 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   const thinkingType = body.thinking?.type;
   const wantThinking = !!body.thinking && thinkingType !== "disabled";
   // grafias de effort já vistas no Claude Code e em harnesses: output_config.effort (2.x) →
-  // reasoning.effort → effort → level → depth (numérico) → thinking.budget_tokens por faixa.
+  // reasoning_effort → reasoning.effort → effort → level → depth → budget_tokens.
   // A wire aceita os 5 níveis; o resolveModel valida e descarta o que não for um deles.
   const cfgEffort = (() => {
-    for (const v of [body.output_config?.effort, body.reasoning?.effort, body.effort, body.level]) {
+    for (const v of [body.output_config?.effort, body.reasoning_effort, body.reasoning?.effort, body.effort, body.level]) {
       if (typeof v === "string" && EFFORT_LEVELS.includes(v)) return v;
     }
     if (body.depth != null) {
@@ -376,11 +391,12 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     return true;
   }
 
+  const wireTools = body.tool_choice?.type === "none" ? [] : toWireTools(body.tools);
   const generateBody = buildGenerateBody({
     model,
     messages: wireMessages,
     system: systemOf(body),
-    tools: body.tool_choice?.type === "none" ? [] : toWireTools(body.tools),
+    tools: wireTools,
     maxTokens: body.max_tokens,
     temperature: body.temperature,
     topP: body.top_p,
@@ -424,11 +440,11 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   let sawToolUse = false;
 
   const stopFilter = makeStopFilter(stops);
-  let lastWrite = Date.now();
+  const clientToolNames = new Set(wireTools.map((tool) => tool.name));
   let lastByteAt = Date.now(); // idle watchdog: renovado a cada byte do upstream e durante o re-chunk do thinking
+  let thinkingPacingSpent = 0;
   const sendEvent = (type: string, data: object) => {
     res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
-    lastWrite = Date.now();
   };
 
   // máquina de estado dos blocos: um bloco fecha antes do próximo abrir, índices sequenciais
@@ -475,9 +491,69 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     const chunks = chunkRunes(text, THINK_CHUNK);
     appendText("thinking", chunks[0]);
     for (const c of chunks.slice(1)) {
-      lastByteAt = Date.now(); // o await do pacing pausa o readEvents; sem isso o idle watchdog abortaria durante o re-chunk
-      await new Promise((r) => setTimeout(r, THINK_DELAY));
+      if (thinkingPacingSpent < THINK_PACING_BUDGET) {
+        lastByteAt = Date.now(); // o pacing pausa o readEvents; não confundir a pausa local com idle upstream
+        await new Promise((r) => setTimeout(r, THINK_DELAY));
+        thinkingPacingSpent += THINK_DELAY;
+      }
       appendText("thinking", c);
+    }
+  }
+
+  // O commandcode expõe os argumentos incrementalmente antes do evento final `tool-call`.
+  // Para tool calls paralelas, os deltas podem se intercalar; a wire Anthropic exige blocos
+  // sequenciais, então o primeiro flui ao vivo e os seguintes acumulam até o anterior fechar.
+  type StreamToolInput = {
+    id: string;
+    name: string;
+    chunks: string[];
+    emitted: number;
+    ended: boolean;
+    index: number | null;
+    streamable: boolean;
+  };
+  const toolInputs = new Map<string, StreamToolInput>();
+  const toolInputQueue: string[] = [];
+  let activeToolInput: string | null = null;
+
+  function activateNextToolInput(): void {
+    if (!stream || activeToolInput) return;
+    while (toolInputQueue.length) {
+      const id = toolInputQueue.shift() as string;
+      const state = toolInputs.get(id);
+      if (!state || !state.streamable || state.index !== null) continue;
+      closeBlock();
+      state.index = nextIndex++;
+      activeToolInput = id;
+      sendEvent("content_block_start", {
+        type: "content_block_start",
+        index: state.index,
+        content_block: { type: "tool_use", id: state.id, name: state.name, input: {} },
+      });
+      while (state.emitted < state.chunks.length) {
+        sendEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: state.index,
+          delta: { type: "input_json_delta", partial_json: state.chunks[state.emitted++] },
+        });
+      }
+      if (state.ended) {
+        sendEvent("content_block_stop", { type: "content_block_stop", index: state.index });
+        activeToolInput = null;
+        continue;
+      }
+      return;
+    }
+  }
+
+  function endToolInput(id: string): void {
+    const state = toolInputs.get(id);
+    if (!state) return;
+    state.ended = true;
+    if (activeToolInput === id && state.index !== null) {
+      sendEvent("content_block_stop", { type: "content_block_stop", index: state.index });
+      activeToolInput = null;
+      activateNextToolInput();
     }
   }
 
@@ -491,11 +567,48 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     content.push({ type: "tool_use", id: toolId, name, input });
     sawToolUse = true;
     if (!stream) return;
+    const incremental = toolInputs.get(toolId);
+    if (incremental?.streamable) {
+      if (!incremental.ended) endToolInput(toolId);
+      // O bloco já foi emitido pelos eventos tool-input-*; o evento final serve como
+      // fonte autoritativa para o objeto da resposta não-stream/conteúdo acumulado.
+      if (incremental.index !== null) return;
+    }
     closeBlock();
     const index = nextIndex++;
     sendEvent("content_block_start", { type: "content_block_start", index, content_block: { type: "tool_use", id: toolId, name, input: {} } });
     // a wire entrega o input completo de uma vez; um único delta é válido (o SDK só concatena)
     sendEvent("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
+    sendEvent("content_block_stop", { type: "content_block_stop", index });
+  }
+
+  function closeToolInputs(): void {
+    if (!stream) return;
+    for (const state of toolInputs.values()) state.ended = true;
+    if (activeToolInput) {
+      const state = toolInputs.get(activeToolInput);
+      if (state?.index !== null && state?.index !== undefined) {
+        sendEvent("content_block_stop", { type: "content_block_stop", index: state.index });
+      }
+      activeToolInput = null;
+    }
+    activateNextToolInput();
+  }
+
+  // Anthropic nunca encerra uma mensagem bem-formada sem ao menos um content block.
+  // Isso ocorre quando todo o budget foi consumido no reasoning suprimido ou quando
+  // o único evento foi uma tool server-side.
+  function ensureAnyContentBlock(): void {
+    if (content.length) return;
+    content.push({ type: "text", text: "" });
+    if (!stream) return;
+    closeBlock();
+    const index = nextIndex++;
+    sendEvent("content_block_start", {
+      type: "content_block_start",
+      index,
+      content_block: { type: "text", text: "" },
+    });
     sendEvent("content_block_stop", { type: "content_block_stop", index });
   }
 
@@ -528,6 +641,44 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
             if (text) await appendThinking(text);
             break;
           }
+          case "tool-input-start": {
+            if (!stream || !ev.id || !ev.toolName) break;
+            const state: StreamToolInput = {
+              id: ev.id,
+              name: ev.toolName,
+              chunks: [],
+              emitted: 0,
+              ended: false,
+              index: null,
+              // Só antecipe tools declaradas pelo cliente. Tools server-side não podem
+              // vazar como tool_use antes de sabermos providerExecuted no evento final.
+              streamable: clientToolNames.has(ev.toolName),
+            };
+            toolInputs.set(ev.id, state);
+            if (state.streamable) {
+              toolInputQueue.push(ev.id);
+              activateNextToolInput();
+            }
+            break;
+          }
+          case "tool-input-delta": {
+            if (!stream || !ev.id || typeof ev.delta !== "string") break;
+            const state = toolInputs.get(ev.id);
+            if (!state?.streamable) break;
+            state.chunks.push(ev.delta);
+            if (activeToolInput === ev.id && state.index !== null) {
+              sendEvent("content_block_delta", {
+                type: "content_block_delta",
+                index: state.index,
+                delta: { type: "input_json_delta", partial_json: ev.delta },
+              });
+              state.emitted++;
+            }
+            break;
+          }
+          case "tool-input-end":
+            if (stream && ev.id) endToolInput(ev.id);
+            break;
           case "tool-call": {
             // tool executada pelo próprio servidor (web_search/web_fetch): não vira tool_use
             if (ev.providerExecuted === true) break;
@@ -555,13 +706,12 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
   // ---------- stream (SSE) ----------
   if (stream) {
     sseHead(res);
-    // keepalive: mesmo heartbeat da Messages API real; mantém o stream vivo durante pausas
-    // longas de reasoning (proxies/timeouts de idle na camada de rede).
+    // Keepalive em cadência fixa, como a Messages API real. Usar "3s desde a última
+    // escrita" num timer também de 3s podia perder o primeiro tick por poucos ms e só
+    // emitir aos 6s, tarde demais para intermediários com timeout curto.
     pingTimer = setInterval(() => {
-      if (Date.now() - lastWrite < PING_MS) return; // só se nada foi escrito no último tick
       try {
         res.write(`event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`);
-        lastWrite = Date.now();
       } catch {
         if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       }
@@ -582,7 +732,9 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
         const tail = stopFilter.flush();
         if (tail) appendText("text", tail);
       }
+      closeToolInputs();
       closeBlock();
+      ensureAnyContentBlock();
       sendEvent("message_delta", {
         type: "message_delta",
         delta: { stop_reason: stopReason(), stop_sequence: stopSequence },
@@ -631,6 +783,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, path: st
     const tail = stopFilter.flush();
     if (tail) appendText("text", tail);
   }
+  ensureAnyContentBlock();
 
   json(res, 200, {
     id,

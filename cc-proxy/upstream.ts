@@ -46,7 +46,7 @@ export interface WireUsage {
   totalTokens?: number;
   cachedInputTokens?: number;
   reasoningTokens?: number;
-  inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
+  inputTokenDetails?: { noCacheTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number };
   outputTokenDetails?: { reasoningTokens?: number };
 }
 
@@ -63,6 +63,9 @@ export type WireToolCallEvent = {
 export type WireEvent =
   | { type: "text-delta"; text?: string }
   | { type: "reasoning-delta"; text?: string }
+  | { type: "tool-input-start"; id?: string; toolName?: string; dynamic?: boolean }
+  | { type: "tool-input-delta"; id?: string; delta?: string }
+  | { type: "tool-input-end"; id?: string }
   | WireToolCallEvent
   | { type: "tool-result"; toolCallId?: string; toolName?: string; output?: unknown }
   | { type: "finish"; finishReason?: string; rawFinishReason?: string; totalUsage?: WireUsage | null }
@@ -235,6 +238,7 @@ export async function* readEvents(readable: ReadableStream<Uint8Array>, opts?: {
   const reader = readable.getReader();
   const dec = new TextDecoder();
   let buf = "";
+  let decodeErrors = 0;
   try {
     for (;;) {
       const { done, value } = await reader.read();
@@ -245,11 +249,21 @@ export async function* readEvents(readable: ReadableStream<Uint8Array>, opts?: {
       buf = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
-        try { yield JSON.parse(line) as WireEvent; } catch {}
+        try {
+          const event = JSON.parse(line) as WireEvent;
+          decodeErrors = 0;
+          yield event;
+        } catch {
+          decodeErrors++;
+          if (decodeErrors > 3) throw new StreamError("stream NDJSON inválido do commandcode", 502);
+        }
       }
     }
     // última linha sem \n final (traz o `finish` com usage se o upstream não fechar com newline)
-    if (buf.trim()) { try { yield JSON.parse(buf) as WireEvent; } catch {} }
+    if (buf.trim()) {
+      try { yield JSON.parse(buf) as WireEvent; }
+      catch { throw new StreamError("última linha NDJSON inválida do commandcode", 502); }
+    }
   } finally {
     try { await reader.cancel(); } catch {}
   }

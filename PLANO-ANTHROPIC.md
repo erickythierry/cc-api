@@ -453,13 +453,12 @@ sucesso truncado (é exatamente o bug que já foi corrigido no lado OpenAI).
 A wire do commandcode **não tem** endpoint de contagem. Devolver 404 quebra harnesses que usam
 count_tokens para decidir compactação, e chamar o upstream com `max_tokens:1` gastaria crédito.
 
-Implementar **estimativa local**, documentada como aproximação:
+Implementado como **estimativa local**, documentada como aproximação:
 
 ```js
-// ponytail: estimativa por caracteres; a wire não expõe tokenizer.
-// Troca por contagem real se o upstream algum dia publicar um endpoint.
-const chars = JSON.stringify([system, messages, tools]).length;
-return { input_tokens: Math.ceil(chars / 4) };
+// cl100k_base explícito + overhead por mensagem; imagem usa estimativa separada.
+// Continua aproximado porque a wire não expõe o tokenizer DeepSeek.
+return { input_tokens: countTokensBody(body) };
 ```
 
 Resposta: `{"input_tokens": N}` (só esse campo). Validação: mesmo `messages` obrigatório do
@@ -474,7 +473,7 @@ README deve dizer, em uma linha, que o número é estimado (±25%) e não serve 
 | Item | Comportamento |
 |---|---|
 | `cache_control` / prompt caching | aceito e ignorado; `cache_creation_input_tokens` reflete o cache do upstream, não um cache do proxy |
-| blocos `thinking` no request | descartados (a wire não aceita replay de reasoning) |
+| blocos `thinking` no request | preservados como `reasoning`; redacted usa placeholder |
 | `signature` dos blocos `thinking` na resposta | string vazia — não é assinatura válida da Anthropic; serve só para leitura, não para replay |
 | `top_k` | ignorado |
 | `document` (PDF) | 400 |
@@ -539,7 +538,7 @@ Request / conversão (inspecionando `lastUpstreamBody`):
 10. user message com `tool_result` → mensagem wire `role:"tool"` com `toolCallId`/`toolName` corretos.
 11. user message com `tool_result` **+** `text` → duas mensagens wire, `tool` antes de `user`.
 12. `tool_result.is_error: true` → value prefixado com `"Error: "`.
-13. assistant com bloco `thinking` → descartado, resto preservado.
+13. assistant com bloco `thinking` → preservado como `reasoning`, resto preservado.
 14. imagem base64 → `{type:"image",image:"data:...",mimeType}`.
 15. `output_config.effort:"high"` → `params.reasoning_effort === "high"`.
 16. modelo com sufixo `-max` + `output_config.effort:"low"` → vence o sufixo (`"max"`).
@@ -553,7 +552,8 @@ Resposta não-stream:
 21. cenário `no-trailing-newline` → `usage.input_tokens === 10` (não pode zerar).
 22. cenário `max-tokens` → `stop_reason:"max_tokens"`.
 23. cenário `reasoning` **sem** `thinking` no request → nenhum bloco `thinking`; **com** `thinking:{type:"adaptive"}` → bloco `thinking` presente.
-24. `usage.cache_read_input_tokens` vem do `cachedInputTokens`/`inputTokenDetails`.
+24. `usage.input_tokens` vem de `noCacheTokens` (ou total menos cache);
+    `cache_read_input_tokens` vem do `cachedInputTokens`/`inputTokenDetails`.
 25. `stop_sequences:["fau"]` no cenário default (texto `"default"`) → content `"de"`, `stop_reason:"stop_sequence"`, `stop_sequence:"fau"`.
 
 Stream:
