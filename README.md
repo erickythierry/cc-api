@@ -23,7 +23,10 @@ Anthropic** (`/v1/messages`), lado a lado, pra qualquer harness que fale uma das
     ├── upstream.ts       # camada comum: auth, wire do commandcode, SSE, erros
     ├── openai.ts         # dialeto OpenAI (/v1/chat/completions)
     ├── anthropic.ts      # dialeto Anthropic (/v1/messages, count_tokens)
+    ├── renew.ts          # renovação automatizada de token via browser headless e CDP
+    ├── renew-cli.ts      # CLI para renovação autônoma de auth (`npm run renew`)
     ├── models.ts         # catálogo de modelos
+    ├── Dockerfile        # imagem Docker pronta com Chromium para operação contínua
     ├── tsconfig.json     # strict + erasableSyntaxOnly (Node roda os .ts sem build)
     ├── test.mjs          # suite de testes (mock + SDKs oficiais + reais)
     ├── package.json
@@ -37,7 +40,9 @@ harness (OpenAI ou Anthropic) ──► cc-proxy :8787 ──► api.commandcode
                                    sem auth local      (Bearer key de ~/.commandcode/auth.json)
 ```
 
-1. **Login** (uma vez): `command-code login` grava a key em `~/.commandcode/auth.json`.
+1. **Login e renovação autônoma**:
+   - Faça login via CLI: `command-code login` (grava em `~/.commandcode/auth.json`), ou
+   - Deixe o proxy renovar sozinho via navegador headless (ideal para Docker e servidores): `CC_COOKIES="better-auth.session_token=..." npm run renew` (em `cc-proxy/`).
 2. **Sobe o proxy**: `cd cc-proxy && PORT=8787 npm start`.
 3. **Aponta o harness**:
    - OpenAI: `baseURL = http://localhost:8787/v1` (ou `/openai/v1`)
@@ -46,6 +51,17 @@ harness (OpenAI ou Anthropic) ──► cc-proxy :8787 ──► api.commandcode
 O conflito de `GET /v1/models` (existe nos dois padrões, com shapes diferentes) é resolvido pelo
 header: `anthropic-version`/`x-api-key` → shape Anthropic; senão OpenAI. Os prefixos
 `/openai/*` e `/anthropic/*` forçam o dialeto de forma determinística.
+
+## Operação Autônoma (Renovação de Token via Browser Headless)
+
+O CommandCode emite API keys com TTL de curta duração (~alguns dias) e não fornece endpoint de refresh de API token. Para permitir que o proxy opere 24/7 sem intervenção manual ou expiração de chave:
+
+1. O módulo `renew.ts` sobe uma instância do Chromium (headless ou com perfil persistente) controlada via **Chrome DevTools Protocol (CDP)** sem dependências pesadas como Puppeteer ou Playwright.
+2. Injeta a sessão salva (`CC_COOKIES` ou cookie de login do browser) e navega até a URL de autorização OAuth do CommandCode com callback local temporário.
+3. O script aceita a autorização automaticamente via CDP, intercepta a nova `apiKey` emitida e regrava `~/.commandcode/auth.json`.
+4. Pode ser acionado via CLI (`npm run renew`) ou em background/cron em servidores e containers Docker.
+
+Mais detalhes de uso em [`cc-proxy/README.md`](./cc-proxy/README.md).
 
 ## Validação
 
