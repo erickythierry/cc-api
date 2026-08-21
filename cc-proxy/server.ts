@@ -7,7 +7,7 @@ import type { IncomingMessage } from "node:http";
 import { randomUUID } from "node:crypto";
 
 import { DEFAULT_MODEL } from "./models.ts";
-import { API_BASE, API_KEY, json } from "./upstream.ts";
+import { API_BASE, getApiKey, json } from "./upstream.ts";
 import * as openai from "./openai.ts";
 import * as anthropic from "./anthropic.ts";
 
@@ -16,9 +16,8 @@ const HOST = process.env.HOST || "127.0.0.1"; // key sem auth: loopback por padr
 
 type Dialect = "openai" | "anthropic";
 
-if (!API_KEY) {
-  console.error("[cc-proxy] Sem API key. Export COMMAND_CODE_API_KEY ou rode `command-code login`.");
-  process.exit(1);
+if (!getApiKey()) {
+  console.warn("[cc-proxy] Aviso: Sem API key no boot. O proxy iniciará aguardando login ou renovação.");
 }
 
 // `/v1/messages` só existe no Anthropic e `/v1/chat/completions` só no OpenAI; o conflito é

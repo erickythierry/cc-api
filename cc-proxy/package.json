@@ -9,6 +9,8 @@
   },
   "scripts": {
     "start": "node server.ts",
+    "renew": "node renew-cli.ts",
+    "renew:visible": "node renew-cli.ts --visible",
     "typecheck": "tsc --noEmit",
     "test": "node test.mjs",
     "test:mock": "node test.mjs --mock",

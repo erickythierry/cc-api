@@ -68,7 +68,38 @@ Ver `http://localhost:8787/healthz`.
 
 Qualquer `api_key` serve (o proxy ignora e usa a do commandcode).
 
-## Exemplo rápido
+## Renovação de Token & Automação Headless
+
+O CommandCode emite tokens de curta duração via fluxo OAuth web. O proxy suporta renovação 100% headless via Chromium embutido.
+
+### Modos de uso:
+
+1. **Via cookies da sessão (Ideal para Docker/Server)**:
+   Pegue o cookie da sua sessão web em `commandcode.ai` (via DevTools do navegador) e passe na env `CC_COOKIES`:
+   ```bash
+   CC_COOKIES="better-auth.session_token=...;" npm run renew
+   ```
+
+2. **Via volume persistente de browser (`browser-data`)**:
+   Faça o login 1x na máquina local e monte o diretório `~/.commandcode` no Docker:
+   ```bash
+   npm run renew:visible
+   ```
+
+### No Docker (Servidor Linux sem GUI):
+O Dockerfile inclui Chromium headless (`node:22-bookworm-slim`).
+```bash
+docker run -d \
+  --name cc-proxy \
+  -p 127.0.0.1:8787:8787 \
+  -e CC_COOKIES="better-auth.session_token=..." \
+  -v ~/.commandcode:/root/.commandcode \
+  cc-proxy
+```
+Para renovar a qualquer momento dentro do container:
+```bash
+docker exec cc-proxy npm run renew
+```
 
 ```bash
 curl http://localhost:8787/v1/chat/completions \

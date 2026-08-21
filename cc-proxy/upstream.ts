@@ -91,7 +91,7 @@ export function errStatus(e: unknown): number {
 }
 
 // ---------- auth ----------
-function getKey(): string | null {
+export function getApiKey(): string | null {
   if (process.env.COMMAND_CODE_API_KEY) return process.env.COMMAND_CODE_API_KEY.trim();
   try {
     return JSON.parse(readFileSync(join(homedir(), ".commandcode", "auth.json"), "utf8")).apiKey ?? null;
@@ -99,7 +99,7 @@ function getKey(): string | null {
     return null;
   }
 }
-export const API_KEY = getKey();
+export const API_KEY = getApiKey();
 
 // `config` é obrigatório na wire (Zod server-side), mas o conteúdo só alimenta o prompt de
 // agente do CLI — que não usamos. Mandamos o mínimo válido em vez de vazar cwd/git do usuário.
@@ -117,10 +117,11 @@ export const SERVER_CONFIG = {
 
 // ---------- headers padrão (buildCommandAuthHeaders do CLI) ----------
 export function authHeaders(sessionId: string): Record<string, string> {
+  const key = getApiKey();
   return {
     "Content-Type": "application/json",
     "User-Agent": "cli",
-    Authorization: `Bearer ${API_KEY}`,
+    Authorization: `Bearer ${key}`,
     "x-command-code-version": API_VERSION,
     "x-cli-environment": "production",
     "x-project-slug": "cc-proxy",
