@@ -173,6 +173,21 @@ executá-la.
 - `premium_credits_exhausted` → créditos premium esgotados.
 - `insufficient credits` / `usage window limit` / `rate limit` → limites de plano.
 
+## Renovação de Token (OAuth CLI Headless)
+
+O CommandCode emite API keys com TTL server-side de curta duração (~alguns dias).
+Como o backend não oferece endpoint `/alpha/auth/refresh`, o ciclo de renovação ocorre pelo fluxo do site:
+
+1. Subir servidor HTTP em porta local arbitrária (`127.0.0.1:PORT/callback`).
+2. Abrir `https://commandcode.ai/studio/auth/cli?callback=http://localhost:PORT/callback&state=TOKEN`
+3. Injetar cookies de sessão (`__Secure-commandcode_prod_.session_token` e `.session_data`).
+4. Desabilitar restrições de *Private Network Access* (`--disable-features=BlockInsecurePrivateNetworkRequests...`) no Chromium para permitir que o site faça POST no `localhost`.
+5. Acionar o botão **Authorize** via CDP (`Runtime.evaluate`).
+6. O frontend envia POST para o callback local contendo a nova `apiKey`.
+7. Gravar a nova chave em `~/.commandcode/auth.json`.
+
+Esse fluxo está implementado em `cc-proxy/renew.ts` e roda 100% headless dentro do Docker via `npm run renew`.
+
 ## Como testar
 
 1. `command-code login` (uma vez, browser) — grava `~/.commandcode/auth.json`.
